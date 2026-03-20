@@ -1,0 +1,222 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: #0A0F1C;
+    color: #F8FAFC;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.5;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #1E293B;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #334155;
+  }
+
+  /* Selection */
+  ::selection {
+    background: rgba(37, 99, 235, 0.3);
+    color: #F8FAFC;
+  }
+}
+
+@layer components {
+  /* Skeleton shimmer */
+  .skeleton {
+    @apply bg-surface-border rounded-lg;
+    background: linear-gradient(
+      90deg,
+      #1E293B 0%,
+      #273447 50%,
+      #1E293B 100%
+    );
+    background-size: 1000px 100%;
+    animation: shimmer 1.5s infinite linear;
+  }
+
+  /* Glass card */
+  .glass-card {
+    background: rgba(17, 24, 39, 0.8);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(30, 41, 59, 0.8);
+  }
+
+  /* Focus ring */
+  .focus-ring {
+    @apply outline-none ring-2 ring-primary ring-offset-2 ring-offset-surface-bg;
+  }
+
+  /* Scrollable container that hides scrollbar on mobile */
+  .scroll-container {
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #1E293B transparent;
+  }
+
+  /* Chat bubble user */
+  .bubble-user {
+    @apply bg-primary text-white rounded-2xl rounded-br-sm px-4 py-2.5 max-w-[75%] break-words;
+  }
+
+  /* Chat bubble AI */
+  .bubble-ai {
+    @apply bg-surface-card border border-surface-border text-text-primary rounded-2xl rounded-bl-sm px-4 py-2.5 max-w-[75%] break-words;
+  }
+
+  /* Sidebar nav item */
+  .nav-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-xl text-text-muted text-sm font-medium transition-all duration-150 cursor-pointer;
+  }
+  .nav-item:hover {
+    @apply bg-surface-hover text-text-secondary;
+  }
+  .nav-item.active {
+    @apply bg-primary/10 text-primary;
+  }
+
+  /* Status pills */
+  .pill-pending {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-warning/15 text-warning;
+  }
+  .pill-sent {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary/15 text-primary-glow;
+  }
+  .pill-positive {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-success/15 text-success;
+  }
+  .pill-negative {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-error/15 text-error;
+  }
+
+  /* Score bar */
+  .score-high { @apply text-success; }
+  .score-mid  { @apply text-warning; }
+  .score-low  { @apply text-error; }
+
+  /* Typing indicator dots */
+  .typing-dot:nth-child(1) { animation: typingDot 1.4s ease-in-out infinite 0ms; }
+  .typing-dot:nth-child(2) { animation: typingDot 1.4s ease-in-out infinite 200ms; }
+  .typing-dot:nth-child(3) { animation: typingDot 1.4s ease-in-out infinite 400ms; }
+
+  /* Grid background texture */
+  .grid-bg {
+    background-image: url("data:image/svg+xml,%3Csvg width='32' height='32' viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 .5H31.5V32' fill='none' stroke='%231E293B' stroke-width='0.5'/%3E%3C/svg%3E");
+  }
+}
+
+/* Streaming cursor */
+.streaming-cursor::after {
+  content: '▌';
+  color: #2563EB;
+  animation: blink 1s step-end infinite;
+  margin-left: 1px;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Drag-and-drop */
+.dnd-dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+.dnd-over {
+  border-color: #2563EB !important;
+  background: rgba(37, 99, 235, 0.05) !important;
+}
+
+/* Markdown content in chat */
+.prose-chat h1, .prose-chat h2, .prose-chat h3 {
+  font-family: 'Syne', system-ui, sans-serif;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  margin-top: 0.75rem;
+}
+.prose-chat p { margin-bottom: 0.5rem; }
+.prose-chat ul, .prose-chat ol {
+  margin-left: 1.25rem;
+  margin-bottom: 0.5rem;
+}
+.prose-chat li { margin-bottom: 0.25rem; }
+.prose-chat code {
+  background: rgba(37, 99, 235, 0.1);
+  border: 1px solid rgba(37, 99, 235, 0.2);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+}
+.prose-chat pre {
+  background: #0A0F1C;
+  border: 1px solid #1E293B;
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+.prose-chat pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+.prose-chat strong { color: #F8FAFC; font-weight: 600; }
+.prose-chat blockquote {
+  border-left: 3px solid #2563EB;
+  padding-left: 0.75rem;
+  color: #CBD5E1;
+  font-style: italic;
+  margin: 0.5rem 0;
+}
+
+/* ── Streaming cursor (replaces TypingIndicator bouncing dots) ── */
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.streaming-cursor::after {
+  content: '▋';
+  display: inline-block;
+  animation: blink-cursor 0.8s ease-in-out infinite;
+  color: #6366f1;
+  font-size: 0.875rem;
+  vertical-align: middle;
+  margin-left: 2px;
+}
+
+/* ── Confetti burst — welcome.jsx first-win celebration (§9.4) ── */
+@keyframes confetti {
+  0%   { transform: translateY(0) rotate(0deg);   opacity: 1; }
+  80%  { opacity: 1; }
+  100% { transform: translateY(110vh) rotate(720deg); opacity: 0; }
+}
+
+.animate-confetti {
+  animation: confetti linear forwards;
+}

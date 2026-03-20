@@ -1,0 +1,108 @@
+// src/App.jsx
+import React, { useEffect } from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { useAuthStore } from './stores/authStore'
+import AppLayout from './components/layout/AppLayout'
+import DebugPanel from './components/ui/DebugPanel'
+import { lazy, Suspense } from 'react'
+
+const LoginPage          = lazy(() => import('./pages/auth/login'))
+const RegisterPage       = lazy(() => import('./pages/auth/register'))
+const ForgotPage         = lazy(() => import('./pages/auth/forgot-password'))
+const AuthCallbackPage   = lazy(() => import('./pages/auth/callback'))   // ← NEW
+const OnboardingPage     = lazy(() => import('./pages/onboarding'))
+const DashboardPage      = lazy(() => import('./pages/dashboard'))
+const OpportunitiesPage  = lazy(() => import('./pages/opportunities'))
+const PipelinePage       = lazy(() => import('./pages/pipeline'))
+const ChatPage           = lazy(() => import('./pages/chat'))
+const PracticePage       = lazy(() => import('./pages/practice'))
+const CalendarPage       = lazy(() => import('./pages/calendar'))
+const MetricsPage        = lazy(() => import('./pages/metrics'))
+const SettingsPage       = lazy(() => import('./pages/settings'))
+const FeedbackPage       = lazy(() => import('./pages/feedback'))
+const GoalsPage          = lazy(() => import('./pages/goals'))
+const GrowthHistoryPage  = lazy(() => import('./pages/growth'))
+
+function FullscreenLoader() {
+  return (
+    <div className="flex h-screen items-center justify-center bg-surface-bg">
+      <div className="flex flex-col items-center gap-4">
+        <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center animate-pulse">
+          <svg viewBox="0 0 24 24" fill="none" className="w-6 h-6 text-primary-glow">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </div>
+        <p className="text-sm text-text-muted">Loading FounderSales…</p>
+      </div>
+    </div>
+  )
+}
+
+function RequireAuth({ children }) {
+  const { isAuthenticated, isInitialized, user } = useAuthStore()
+  if (!isInitialized) return <FullscreenLoader />
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  if (isAuthenticated && user && !user.onboarding_completed) return <Navigate to="/onboarding" replace />
+  return children
+}
+
+function RequireGuest({ children }) {
+  const { isAuthenticated, isInitialized, user } = useAuthStore()
+  if (!isInitialized) return <FullscreenLoader />
+  if (isAuthenticated) {
+    if (user && !user.onboarding_completed) return <Navigate to="/onboarding" replace />
+    return <Navigate to="/dashboard" replace />
+  }
+  return children
+}
+
+function RequireOnboarding({ children }) {
+  const { isAuthenticated, isInitialized, user } = useAuthStore()
+  if (!isInitialized) return <FullscreenLoader />
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  if (user?.onboarding_completed) return <Navigate to="/dashboard" replace />
+  return children
+}
+
+export default function App() {
+  const initialize = useAuthStore(s => s.initialize)
+  useEffect(() => { initialize() }, [initialize])
+
+  return (
+    <BrowserRouter>
+      <Suspense fallback={<FullscreenLoader />}>
+        <Routes>
+          {/* Public auth routes */}
+          <Route path="/login"            element={<RequireGuest><LoginPage /></RequireGuest>} />
+          <Route path="/register"         element={<RequireGuest><RegisterPage /></RequireGuest>} />
+          <Route path="/forgot-password"  element={<RequireGuest><ForgotPage /></RequireGuest>} />
+
+          {/* OAuth / email verification callback — always accessible */}
+          <Route path="/auth/callback"    element={<AuthCallbackPage />} />
+
+          {/* Onboarding — auth required, onboarding not complete */}
+          <Route path="/onboarding"       element={<RequireOnboarding><OnboardingPage /></RequireOnboarding>} />
+
+          {/* Protected app routes */}
+          <Route path="/" element={<RequireAuth><AppLayout /></RequireAuth>}>
+            <Route index                      element={<Navigate to="/dashboard" replace />} />
+            <Route path="dashboard"           element={<DashboardPage />} />
+            <Route path="goals"               element={<GoalsPage />} />
+            <Route path="growth"              element={<GrowthHistoryPage />} />
+            <Route path="opportunities"       element={<OpportunitiesPage />} />
+            <Route path="pipeline"            element={<PipelinePage />} />
+            <Route path="chat/*"              element={<ChatPage />} />
+            <Route path="practice/*"          element={<PracticePage />} />
+            <Route path="calendar"            element={<CalendarPage />} />
+            <Route path="metrics"             element={<MetricsPage />} />
+            <Route path="settings"            element={<SettingsPage />} />
+            <Route path="feedback"            element={<FeedbackPage />} />
+          </Route>
+
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Routes>
+      </Suspense>
+      <DebugPanel />
+    </BrowserRouter>
+  )
+}

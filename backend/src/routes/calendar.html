@@ -1,0 +1,143 @@
+// src/routes/calendar.js
+// ============================================================
+// CLUTCH CALENDAR SYSTEM — AI prep powered by Groq
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import { generateEventPrep } from '../services/groq.js';
+import { notifyUser, Notifications } from '../services/notifications.js';
+import supabaseAdmin from '../config/supabase.js';
+
+const router = Router();
+
+// GET /api/calendar
+router.get('/', asyncHandler(async (req, res) => {
+  const { from, to } = req.query;
+  const today = new Date().toISOString().split('T')[0];
+
+  let query = supabaseAdmin
+    .from('user_events')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .gte('event_date', from || today)
+    .order('event_date', { ascending: true });
+
+  if (to) query = query.lte('event_date', to);
+
+  const { data: events, error } = await query;
+  if (error) throw error;
+
+  res.json({ events: events || [] });
+}));
+
+// POST /api/calendar
+router.post('/', asyncHandler(async (req, res) => {
+  const {
+    title, event_date, event_type = 'meeting',
+    notes, attendee_name, attendee_context, opportunity_id
+  } = req.body;
+
+  if (!title || !event_date) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: 'title and event_date are required'
+    });
+  }
+
+  const { data: event, error } = await supabaseAdmin
+    .from('user_events')
+    .insert({
+      user_id:          req.user.id,
+      title,
+      event_date,
+      event_type,
+      notes:            notes?.trim() || null,
+      attendee_name:    attendee_name?.trim() || null,
+      attendee_context: attendee_context?.trim() || null,
+      opportunity_id:   opportunity_id || null
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  generateAndSavePrep(req.user, event);
+
+  res.status(201).json({
+    event,
+    message: "Event created! AI prep (talking points, research) will be ready shortly."
+  });
+}));
+
+// GET /api/calendar/:id
+router.get('/:id', asyncHandler(async (req, res) => {
+  const { data: event, error } = await supabaseAdmin
+    .from('user_events')
+    .select('*')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (error || !event) return res.status(404).json({ error: 'NOT_FOUND', message: 'Event not found' });
+  res.json({ event });
+}));
+
+// PUT /api/calendar/:id
+router.put('/:id', asyncHandler(async (req, res) => {
+  const { title, event_date, event_type, notes, attendee_name, attendee_context } = req.body;
+
+  const { error } = await supabaseAdmin
+    .from('user_events')
+    .update({ title, event_date, event_type, notes, attendee_name, attendee_context })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+
+  if (error) throw error;
+  res.json({ success: true });
+}));
+
+// DELETE /api/calendar/:id
+router.delete('/:id', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('user_events')
+    .delete()
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+  res.json({ success: true });
+}));
+
+// POST /api/calendar/:id/regenerate-prep
+router.post('/:id/regenerate-prep', asyncHandler(async (req, res) => {
+  const { data: event } = await supabaseAdmin
+    .from('user_events')
+    .select('*')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!event) return res.status(404).json({ error: 'NOT_FOUND', message: 'Event not found' });
+
+  const prep = await generateEventPrep(req.user, event);
+
+  await supabaseAdmin
+    .from('user_events')
+    .update({ prep_content: prep, prep_generated: true, prep_generated_at: new Date().toISOString() })
+    .eq('id', event.id);
+
+  res.json({ success: true, prep_content: prep });
+}));
+
+async function generateAndSavePrep(user, event) {
+  try {
+    const prep = await generateEventPrep(user, event);
+    await supabaseAdmin
+      .from('user_events')
+      .update({ prep_content: prep, prep_generated: true, prep_generated_at: new Date().toISOString() })
+      .eq('id', event.id);
+  } catch (err) {
+    console.warn('[Calendar] Prep generation failed:', err.message);
+  }
+}
+
+export default router;

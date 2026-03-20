@@ -1,0 +1,577 @@
+// src/routes/chat.js
+// ============================================================
+// CHAT SYSTEM — Groq Multi-Model Version
+//
+// FIX BUG-1: Perplexity citations were being streamed to the
+// frontend but 'content' (without citations) was saved to DB.
+// On page reload, messages showed without citations. Fixed:
+// now saves 'finalContent' (content + citations) to DB.
+//
+// FIX BUG-2: POST /:chatId/message (non-streaming) had no
+// content validation. Empty messages were saved to DB.
+//
+// FIX PERF: Perplexity is only attempted when API key is set.
+// needsChatSearch already returns false when key is missing,
+// so Groq handles all chat when Perplexity isn't configured.
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import { CHAT_TYPES } from '../config/constants.js';
+
+import { callWithFallback, streamWithFallback } from '../services/multiProvider.js';
+import groqService from '../services/groq.js';
+import { streamAndSave, initSSE, sendSSE, endSSE } from '../services/streaming.js';
+import { needsChatSearch, searchForChat, checkPerplexityUsage, incrementUsage } from '../services/perplexity.js';
+import { preprocessAttachmentsForGrok, buildGrokAttachmentPrompt } from '../utils/attachmentProcessor.js';
+import { recordTokenUsage } from '../services/tokenTracker.js';
+import supabaseAdmin from '../config/supabase.js';
+
+const router = Router();
+
+// ──────────────────────────────────────────
+// GET /api/chat
+// ──────────────────────────────────────────
+router.get('/', asyncHandler(async (req, res) => {
+  const { type, limit = 20, offset = 0 } = req.query;
+
+  let query = supabaseAdmin
+    .from('chats')
+    .select(`
+      id, title, chat_type, opportunity_id, created_at, updated_at,
+      last_message_at, message_count, is_archived
+    `)
+    .eq('user_id', req.user.id)
+    .eq('is_archived', false)
+    .order('last_message_at', { ascending: false, nullsFirst: false })
+    .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+  if (type) query = query.eq('chat_type', type);
+
+  const { data: chats, error } = await query;
+  if (error) throw error;
+
+  res.json({ chats: chats || [] });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/chat
+// ──────────────────────────────────────────
+router.post('/', asyncHandler(async (req, res) => {
+  const { title, chat_type = CHAT_TYPES.GENERAL, opportunity_id } = req.body;
+
+  if (!Object.values(CHAT_TYPES).includes(chat_type)) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: `chat_type must be one of: ${Object.values(CHAT_TYPES).join(', ')}`
+    });
+  }
+
+  let chatTitle = title;
+  if (!chatTitle) {
+    if (opportunity_id) {
+      const { data: opp } = await supabaseAdmin
+        .from('opportunities')
+        .select('target_name, target_context, platform')
+        .eq('id', opportunity_id)
+        .eq('user_id', req.user.id)
+        .single();
+      chatTitle = opp ? `Outreach: ${opp.target_name || opp.platform}` : 'New conversation';
+    } else {
+      chatTitle = 'New conversation';
+    }
+  }
+
+  const { data: chat, error } = await supabaseAdmin
+    .from('chats')
+    .insert({ user_id: req.user.id, title: chatTitle, chat_type, opportunity_id: opportunity_id || null })
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  if (opportunity_id) {
+    const { data: opp } = await supabaseAdmin
+      .from('opportunities')
+      .select('target_context, prepared_message, platform, source_url')
+      .eq('id', opportunity_id)
+      .single();
+
+    if (opp) {
+      await supabaseAdmin.from('chat_messages').insert({
+        chat_id:  chat.id,
+        user_id:  req.user.id,
+        role:     'system',
+        content:  `Context: You're refining outreach for someone on ${opp.platform}.\n\nTheir post: ${opp.target_context}\n\nDraft message: ${opp.prepared_message}`
+      });
+    }
+  }
+
+  res.status(201).json({ chat });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/chat/:chatId
+// ──────────────────────────────────────────
+router.get('/:chatId', asyncHandler(async (req, res) => {
+  const { chatId } = req.params;
+  const { limit = 50, before } = req.query;
+
+  const { data: chat, error: chatError } = await supabaseAdmin
+    .from('chats')
+    .select('*')
+    .eq('id', chatId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (chatError || !chat) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Chat not found' });
+  }
+
+  let msgQuery = supabaseAdmin
+    .from('chat_messages')
+    .select('*')
+    .eq('chat_id', chatId)
+    .order('created_at', { ascending: true })
+    .limit(parseInt(limit));
+
+  if (before) msgQuery = msgQuery.lt('created_at', before);
+
+  const { data: messages, error: msgError } = await msgQuery;
+  if (msgError) throw msgError;
+
+  res.json({ chat, messages: messages || [] });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/chat/:chatId/rename
+// ──────────────────────────────────────────
+router.put('/:chatId/rename', asyncHandler(async (req, res) => {
+  const { title } = req.body;
+
+  if (!title?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'title is required' });
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from('chats')
+    .update({ title: title.trim() })
+    .eq('id', req.params.chatId)
+    .eq('user_id', req.user.id)
+    .select('id, title')
+    .single();
+
+  if (error || !data) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Chat not found' });
+  }
+
+  res.json({ success: true, id: data.id, title: data.title });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/chat/:chatId/message
+// NON-STREAMING — uses multi-model fallback
+// ──────────────────────────────────────────
+router.post('/:chatId/message', asyncHandler(async (req, res) => {
+  const { chatId } = req.params;
+  const { content, attachment_ids = [] } = req.body;
+
+  // FIX BUG-2: Validate content (was missing, allowed empty messages)
+  if (!content?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Message content required' });
+  }
+
+  const chat = await verifyChat(chatId, req.user.id);
+  if (!chat) return res.status(404).json({ error: 'NOT_FOUND', message: 'Chat not found' });
+
+  const attachments       = attachment_ids.length ? await getAttachmentData(attachment_ids) : [];
+  const processedAttach   = attachments.length ? await preprocessAttachmentsForGrok(attachments) : [];
+  const attachmentContext = buildGrokAttachmentPrompt(processedAttach);
+
+  await supabaseAdmin
+    .from('chat_messages')
+    .insert({
+      chat_id:     chatId,
+      user_id:     req.user.id,
+      role:        'user',
+      content,
+      attachments: attachments.length ? attachments : []
+    });
+
+  const history = await getChatHistory(chatId, 10);
+
+  const { data: perfProfile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('learned_patterns, positive_rate, total_sent')
+    .eq('user_id', req.user.id)
+    .single();
+
+  // ── CHAT CONTEXT: opportunity injected into system prompt every message ────
+  // Named chatContext (as requested). Fetched fresh each message so the AI
+  // always knows what opportunity this chat is about — no matter how long the
+  // conversation grows. Lives in the system prompt, NOT the user turn.
+  let chatContext = '';
+  if (chat.opportunity_id) {
+    const { data: opp } = await supabaseAdmin
+      .from('opportunities')
+      .select('target_context, prepared_message, platform, target_name')
+      .eq('id', chat.opportunity_id)
+      .single();
+    if (opp) {
+      chatContext =
+        `\n\n── Opportunity Context (keep this in mind for every reply) ──\n` +
+        `Platform: ${opp.platform || 'unknown'}\n` +
+        (opp.target_name     ? `Prospect: ${opp.target_name}\n`                    : '') +
+        (opp.target_context  ? `Their post/context:\n${opp.target_context}\n`     : '') +
+        (opp.prepared_message ? `Draft outreach message:\n${opp.prepared_message}\n` : '') +
+        `────────────────────────────────────────────────────────`;
+    }
+  }
+
+  // ── MEMORY INJECTION (Feature 2) ────────────────────────────────────────
+  // Fetch active memory facts if user has memory_enabled (default: true)
+  let memoryBlock = '';
+  if (req.user.memory_enabled !== false) {
+    const { data: memoryFacts } = await supabaseAdmin
+      .from('user_memory')
+      .select('fact')
+      .eq('user_id', req.user.id)
+      .eq('is_active', true)
+      .order('reinforcement_count', { ascending: false })
+      .limit(20);
+    if (memoryFacts?.length) {
+      memoryBlock = `\n\nWhat you remember about this founder from past conversations:\n${memoryFacts.map((f, i) => `${i + 1}. ${f.fact}`).join('\n')}`;
+    }
+  }
+
+  const { systemPrompt, messages } = await groqService.getCoachResponse(
+    req.user,
+    content + attachmentContext,   // clean: chatContext lives in system prompt, not here
+    history,
+    perfProfile,
+    attachments
+  );
+
+  const { content: aiContent, tokens_in, tokens_out, model_used } = await callWithFallback({
+    systemPrompt: systemPrompt + chatContext + memoryBlock,
+    messages,
+    temperature: 0.7,
+    maxTokens:   1200
+  });
+
+  const { data: aiMsg } = await supabaseAdmin
+    .from('chat_messages')
+    .insert({
+      chat_id:     chatId,
+      user_id:     req.user.id,
+      role:        'assistant',
+      content:     aiContent,
+      model_used,
+      tokens_used: tokens_in + tokens_out
+    })
+    .select()
+    .single();
+
+  await supabaseAdmin
+    .from('chats')
+    .update({
+      last_message_at: new Date().toISOString(),
+      message_count:   supabaseAdmin.rpc ? undefined : undefined // use DB trigger if available
+    })
+    .eq('id', chatId);
+
+  // Update message count safely
+  const { data: chatRow } = await supabaseAdmin.from('chats').select('message_count').eq('id', chatId).single();
+  await supabaseAdmin.from('chats').update({
+    last_message_at: new Date().toISOString(),
+    message_count:   (chatRow?.message_count || 0) + 1
+  }).eq('id', chatId);
+
+  await recordTokenUsage(req.user.id, model_used, tokens_in, tokens_out);
+
+  res.json({ message: aiMsg });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/chat/:chatId/stream  [SSE]
+// ──────────────────────────────────────────
+router.post('/:chatId/stream', asyncHandler(async (req, res) => {
+  const { chatId } = req.params;
+  const { content, attachment_ids = [] } = req.body;
+
+  if (!content?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Message content required' });
+  }
+
+  const chat = await verifyChat(chatId, req.user.id);
+  if (!chat) return res.status(404).json({ error: 'NOT_FOUND', message: 'Chat not found' });
+
+  const attachments       = attachment_ids.length ? await getAttachmentData(attachment_ids) : [];
+  const processedAttach   = attachments.length ? await preprocessAttachmentsForGrok(attachments) : [];
+  const attachmentContext = buildGrokAttachmentPrompt(processedAttach);
+
+  await supabaseAdmin.from('chat_messages').insert({
+    chat_id:     chatId,
+    user_id:     req.user.id,
+    role:        'user',
+    content,
+    attachments: attachments.length ? attachments : []
+  });
+
+  const history = await getChatHistory(chatId);
+
+  const { data: perfProfile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('learned_patterns, positive_rate')
+    .eq('user_id', req.user.id)
+    .single();
+
+  const { systemPrompt, messages } = await groqService.getCoachResponse(
+    req.user, content + attachmentContext, history, perfProfile, attachments
+  );
+
+  // ── CHAT CONTEXT: opportunity injected into system prompt every message ────
+  // FIX: was completely missing from the stream route. Now matches /message.
+  // chatContext lives in system prompt so the AI always knows what opportunity
+  // this conversation is about, no matter how long the thread grows.
+  let chatContext = '';
+  if (chat.opportunity_id) {
+    const { data: opp } = await supabaseAdmin
+      .from('opportunities')
+      .select('target_context, prepared_message, platform, target_name')
+      .eq('id', chat.opportunity_id)
+      .single();
+    if (opp) {
+      chatContext =
+        `\n\n── Opportunity Context (keep this in mind for every reply) ──\n` +
+        `Platform: ${opp.platform || 'unknown'}\n` +
+        (opp.target_name      ? `Prospect: ${opp.target_name}\n`                    : '') +
+        (opp.target_context   ? `Their post/context:\n${opp.target_context}\n`     : '') +
+        (opp.prepared_message ? `Draft outreach message:\n${opp.prepared_message}\n` : '') +
+        `────────────────────────────────────────────────────────`;
+    }
+  }
+
+  // ── MEMORY INJECTION (Feature 2) ────────────────────────────────────────
+  let memoryBlock = '';
+  if (req.user.memory_enabled !== false) {
+    const { data: memFacts } = await supabaseAdmin
+      .from('user_memory')
+      .select('fact')
+      .eq('user_id', req.user.id)
+      .eq('is_active', true)
+      .order('reinforcement_count', { ascending: false })
+      .limit(20);
+    if (memFacts?.length) {
+      memoryBlock = `\n\nWhat you remember about this founder from past conversations:\n${memFacts.map((f, i) => `${i + 1}. ${f.fact}`).join('\n')}`;
+    }
+  }
+  const systemPromptWithMemory = systemPrompt + chatContext + memoryBlock;
+
+  // ── SMART ROUTING: check if this message needs real-time search ───────────
+  // needsChatSearch returns false immediately when Perplexity key is not set
+  const routerDecision = await needsChatSearch(content);
+
+  if (routerDecision.needs_search) {
+    const usageCheck = await checkPerplexityUsage(req.user.id, req.user.tier || 'free');
+
+    if (usageCheck.allowed) {
+      await streamPerplexityResponse({
+        res,
+        userId:      req.user.id,
+        chatId,
+        userMessage: content,
+        systemPrompt: systemPromptWithMemory,
+        supabase:    supabaseAdmin,
+      });
+      return;
+    }
+    // Quota exceeded — fall through to Groq
+    console.log(`[ChatRouter] Perplexity quota exceeded for ${req.user.id}, falling back to Groq`);
+  }
+
+  // ── DEFAULT PATH: Groq streaming ─────────────────────────────────────────
+  await streamAndSave({
+    res,
+    systemPrompt: systemPromptWithMemory,
+    messages,
+    chatId,
+    userId:   req.user.id,
+    supabase: supabaseAdmin,
+    metadata: { model_used: 'groq-multi' },
+    streamFn: streamWithFallback
+  });
+}));
+
+// ──────────────────────────────────────────
+// DELETE /api/chat/:chatId
+// ──────────────────────────────────────────
+router.delete('/:chatId', asyncHandler(async (req, res) => {
+  const { data: chat } = await supabaseAdmin
+    .from('chats')
+    .select('id')
+    .eq('id', req.params.chatId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!chat) return res.status(404).json({ error: 'NOT_FOUND', message: 'Chat not found' });
+
+  await supabaseAdmin.from('chats').update({ is_archived: true }).eq('id', req.params.chatId);
+  res.json({ success: true });
+}));
+
+// ──────────────────────────────────────────
+// HELPERS
+// ──────────────────────────────────────────
+
+/**
+ * Handles Perplexity-powered responses with SSE streaming.
+ *
+ * FIX BUG-1: Previously saved 'content' (without citations) to DB.
+ * The frontend would stream citations to the user but on page reload
+ * messages would show without them. Now saves 'finalContent'.
+ */
+const streamPerplexityResponse = async ({ res, userId, chatId, userMessage, systemPrompt, supabase }) => {
+  initSSE(res);
+
+  let clientConnected = true;
+  res.on('close', () => { clientConnected = false; });
+
+  // Insert placeholder assistant message row
+  const { data: messageRow, error: insertError } = await supabase
+    .from('chat_messages')
+    .insert({
+      chat_id:         chatId,
+      user_id:         userId,
+      role:            'assistant',
+      content:         '',
+      delivery_status: 'pending',
+      model_used:      'perplexity',
+      is_streamed:     true,
+    })
+    .select('id')
+    .single();
+
+  if (insertError) {
+    sendSSE(res, 'error', { message: 'Failed to initialize message' });
+    endSSE(res);
+    return;
+  }
+
+  sendSSE(res, 'message_id', { id: messageRow.id });
+  sendSSE(res, 'provider_switch', { provider: 'perplexity', reason: 'real_time_search' });
+
+  try {
+    const { content, citations } = await searchForChat(userMessage, systemPrompt);
+
+    if (!clientConnected) return;
+
+    // Build final content (with citations)
+    let finalContent = content;
+    if (citations?.length > 0) {
+      const citeText = '\n\n**Sources:** ' + citations.slice(0, 3).map((c, i) =>
+        `[${i + 1}] ${c.url || c}`
+      ).join(' · ');
+      finalContent += citeText;
+    }
+
+    // Stream word by word
+    const words = finalContent.split(' ');
+    for (let i = 0; i < words.length; i++) {
+      if (!clientConnected) break;
+      const token = (i === 0 ? '' : ' ') + words[i];
+      sendSSE(res, 'token', { token });
+      if (i % 8 === 7) await new Promise(r => setTimeout(r, 20));
+    }
+
+    // FIX BUG-1: Save finalContent (with citations) — not the bare content
+    await supabase
+      .from('chat_messages')
+      .update({
+        content:         finalContent,   // ← was: content (missing citations)
+        delivery_status: 'delivered',
+        delivered_at:    new Date().toISOString(),
+        model_used:      'perplexity',
+      })
+      .eq('id', messageRow.id);
+
+    // Update chat stats
+    const { data: chatRow } = await supabase.from('chats').select('message_count').eq('id', chatId).single();
+    await supabase.from('chats').update({
+      last_message_at: new Date().toISOString(),
+      message_count:   (chatRow?.message_count || 0) + 1
+    }).eq('id', chatId);
+
+    const tokensOut = Math.ceil(finalContent.length / 4);
+    await recordTokenUsage(userId, 'perplexity', 0, tokensOut);
+
+    const today = new Date().toISOString().split('T')[0];
+    await supabase.rpc('increment_perplexity_usage', {
+      p_user_id: userId, p_date: today, p_cost_cents: 5
+    }).catch(() => {});
+
+    if (clientConnected) {
+      sendSSE(res, 'complete', { message_id: messageRow.id, tokens_used: tokensOut, model_used: 'perplexity' });
+      endSSE(res);
+    }
+  } catch (err) {
+    console.error('[Chat] Perplexity response failed:', err.message);
+    await supabase
+      .from('chat_messages')
+      .update({ content: '[Real-time search failed. Please try again.]' })
+      .eq('id', messageRow.id);
+    if (clientConnected) {
+      sendSSE(res, 'error', { message: 'Search failed. Please try again.' });
+      endSSE(res);
+    }
+  }
+};
+
+const verifyChat = async (chatId, userId) => {
+  const { data } = await supabaseAdmin
+    .from('chats')
+    .select('*')
+    .eq('id', chatId)
+    .eq('user_id', userId)
+    .single();
+  return data;
+};
+
+const estimateTokens = (text) => Math.ceil((text || '').length / 4);
+
+const getChatHistory = async (chatId, maxMessages = null) => {
+  const tokenBudget = parseInt(process.env.GROQ_CONTEXT_TOKEN_LIMIT || '32000') * 0.6;
+
+  const { data } = await supabaseAdmin
+    .from('chat_messages')
+    .select('role, content')
+    .eq('chat_id', chatId)
+    .in('role', ['user', 'assistant'])
+    .order('created_at', { ascending: false })
+    .limit(maxMessages || 40);
+
+  if (!data?.length) return [];
+
+  let tokenCount = 0;
+  const window   = [];
+
+  for (const msg of data) {
+    const msgTokens = estimateTokens(msg.content);
+    if (tokenCount + msgTokens > tokenBudget && window.length >= 2) break;
+    window.push({ role: msg.role, content: msg.content });
+    tokenCount += msgTokens;
+  }
+
+  return window.reverse();
+};
+
+const getAttachmentData = async (attachmentIds) => {
+  if (!attachmentIds?.length) return [];
+  const { data } = await supabaseAdmin
+    .from('file_uploads')
+    .select('id, public_url, original_filename, file_type, mime_type')
+    .in('id', attachmentIds);
+  return data || [];
+};
+
+export default router;

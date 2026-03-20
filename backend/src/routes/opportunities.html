@@ -1,0 +1,487 @@
+// src/routes/opportunities.js
+// ============================================================
+// OPPORTUNITIES V2 — Groq for scoring/message gen
+//                  — Perplexity for opportunity discovery (unchanged)
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import {
+  PIPELINE_STAGES, OPPORTUNITY_STATUS, OPPORTUNITIES_PER_RUN, MIN_COMPOSITE_SCORE, SENT_PROMPT_DELAY_MS
+} from '../config/constants.js';
+import { discoverOpportunities, checkPerplexityUsage, incrementUsage, searchForChat } from '../services/perplexity.js';  // ← Perplexity untouched
+import groqService from '../services/groq.js';
+import { recordTokenUsage } from '../services/tokenTracker.js';
+import { callWithFallback } from '../services/multiProvider.js';
+import supabaseAdmin from '../config/supabase.js';
+
+const router = Router();
+
+export const buildOpportunityLabel = (opp) => {
+  const platform = opp.platform || 'Unknown';
+  const handle   = opp.target_name || extractHandle(opp.target_context) || null;
+  const snippet  = opp.target_context
+    ? opp.target_context.replace(/\s+/g, ' ').trim().slice(0, 60) + '…'
+    : null;
+
+  const parts = [platform];
+  if (handle)  parts.push(handle);
+  if (snippet) parts.push(`"${snippet}"`);
+  return parts.join(' · ');
+};
+
+// ──────────────────────────────────────────
+// GET /api/opportunities
+// ──────────────────────────────────────────
+router.get('/', asyncHandler(async (req, res) => {
+  const { status = 'active', limit = 20, offset = 0 } = req.query;
+  const userId = req.user.id;
+
+  let query = supabaseAdmin
+    .from('opportunities')
+    .select('*')
+    .eq('user_id', userId)
+    .order('composite_score', { ascending: false })
+    .order('created_at', { ascending: false })
+    .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+  if (status === 'active') query = query.in('status', ['pending', 'viewed', 'acted']);
+  else if (status !== 'all') query = query.eq('status', status);
+
+  const { data: opportunities, error } = await query;
+  if (error) throw error;
+
+  const { count } = await supabaseAdmin
+    .from('opportunities')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .in('status', ['pending', 'viewed', 'acted']);
+
+  res.json({
+    opportunities: opportunities || [],
+    total_active: count || 0,
+    pagination: {
+      limit:    parseInt(limit),
+      offset:   parseInt(offset),
+      has_more: (count || 0) > parseInt(offset) + parseInt(limit)
+    }
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/opportunities/refresh
+// Discovery: Perplexity | Scoring + Messaging: Groq
+// ──────────────────────────────────────────
+router.post('/refresh', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+
+  if (!req.user.onboarding_completed) {
+    return res.status(400).json({
+      error:   'ONBOARDING_REQUIRED',
+      message: 'Complete onboarding first so Clutch knows what to look for.'
+    });
+  }
+
+  // Perplexity discovers opportunities (unchanged)
+  const result = await discoverOpportunities(userId, req.user);
+
+  if (!result.opportunities?.length) {
+    return res.json({
+      success:     true,
+      new_count:   0,
+      model_used:  result.model_used,
+      is_fallback: result.is_fallback,
+      notice:      result.notice || "No new opportunities found right now. Check back in a few hours."
+    });
+  }
+
+  const { data: perfProfile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  // Groq scores opportunities
+  const scoredOpps      = await groqService.scoreOpportunities(req.user, result.opportunities);
+  const qualifyingOpps  = scoredOpps.filter(o =>
+    ((o.fit_score || 0) + (o.timing_score || 0) + (o.intent_score || 0)) / 3 >= MIN_COMPOSITE_SCORE
+  );
+
+  let newCount = 0;
+  for (const opp of qualifyingOpps) {
+    // Groq generates outreach messages
+    const { message, tokens_in, tokens_out } = await groqService.generateOutreachMessage(
+      req.user, opp, perfProfile
+    );
+
+    await recordTokenUsage(userId, 'groq', tokens_in, tokens_out);
+
+    const { error } = await supabaseAdmin
+      .from('opportunities')
+      .insert({
+        user_id:         userId,
+        platform:        opp.platform || 'reddit',
+        source_url:      opp.source_url,
+        target_context:  opp.target_context,
+        target_name:     opp.target_name || null,
+        prepared_message: message,
+        fit_score:       opp.fit_score,
+        timing_score:    opp.timing_score,
+        intent_score:    opp.intent_score,
+        message_style:   perfProfile?.best_message_style || 'empathetic',
+        message_length:  message.split(' ').length,
+        generated_by:    'groq',
+        status:          OPPORTUNITY_STATUS.PENDING,
+        stage:           PIPELINE_STAGES.NEW
+      });
+
+    if (!error) newCount++;
+  }
+
+  res.json({
+    success:     true,
+    new_count:   newCount,
+    model_used:  result.model_used,
+    is_fallback: result.is_fallback,
+    notice:      result.notice,
+    usage:       result.usage
+  });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/opportunities/:id/view
+// ──────────────────────────────────────────
+router.put('/:id/view', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('opportunities')
+    .update({ viewed_at: new Date().toISOString(), status: OPPORTUNITY_STATUS.VIEWED })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .is('viewed_at', null);
+  res.json({ success: true });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/opportunities/:id/click
+// ──────────────────────────────────────────
+router.put('/:id/click', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('opportunities')
+    .update({ link_clicked_at: new Date().toISOString(), status: OPPORTUNITY_STATUS.ACTED })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+
+  res.json({
+    success: true,
+    sent_prompt: {
+      show_after_ms:  SENT_PROMPT_DELAY_MS,
+      opportunity_id: req.params.id,
+      message:        "Did you send the message?",
+      actions: [
+        { label: "Yes, sent it ✓", action: "MARK_SENT" },
+        { label: "Not yet",        action: "DISMISS" }
+      ]
+    }
+  });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/opportunities/:id/copy
+// ──────────────────────────────────────────
+router.put('/:id/copy', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('opportunities')
+    .update({ message_copied_at: new Date().toISOString(), status: OPPORTUNITY_STATUS.ACTED })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+
+  res.json({
+    success: true,
+    sent_prompt: {
+      show_after_ms:  SENT_PROMPT_DELAY_MS,
+      opportunity_id: req.params.id,
+      message:        "Message copied! Did you send it?",
+      actions: [
+        { label: "Sent ✓",   action: "MARK_SENT" },
+        { label: "Not yet",  action: "DISMISS" }
+      ]
+    }
+  });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/opportunities/:id/sent
+// ──────────────────────────────────────────
+router.put('/:id/sent', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('opportunities')
+    .update({
+      marked_sent_at: new Date().toISOString(),
+      status:         OPPORTUNITY_STATUS.SENT,
+      stage:          PIPELINE_STAGES.CONTACTED
+    })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+
+  res.json({
+    success:              true,
+    new_stage:            PIPELINE_STAGES.CONTACTED,
+    message:              "Logged! You'll hear from Clutch in 48 hours to track the outcome.",
+    feedback_prompt_at:   new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/opportunities/:id/regenerate
+// ──────────────────────────────────────────
+router.post('/:id/regenerate', asyncHandler(async (req, res) => {
+  const { style } = req.body;
+
+  const { data: opp, error } = await supabaseAdmin
+    .from('opportunities')
+    .select('*')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (error || !opp) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Opportunity not found' });
+  }
+
+  const { data: perfProfile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .single();
+
+  const userWithStyle = {
+    ...req.user,
+    voice_profile: { ...req.user.voice_profile, voice_style: style || req.user.voice_profile?.voice_style }
+  };
+
+  const { message, tokens_in, tokens_out } = await groqService.generateOutreachMessage(
+    userWithStyle, opp, perfProfile
+  );
+
+  await recordTokenUsage(req.user.id, 'groq', tokens_in, tokens_out);
+
+  await supabaseAdmin
+    .from('opportunities')
+    .update({
+      prepared_message: message,
+      message_style:    style || opp.message_style,
+      message_length:   message.split(' ').length
+    })
+    .eq('id', req.params.id);
+
+  res.json({ success: true, prepared_message: message });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/opportunities/:id/chat
+// ──────────────────────────────────────────
+router.post('/:id/chat', asyncHandler(async (req, res) => {
+  const opportunityId = req.params.id;
+
+  const { data: existingChat } = await supabaseAdmin
+    .from('chats')
+    .select('id, title')
+    .eq('opportunity_id', opportunityId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (existingChat) {
+    return res.json({ chat_id: existingChat.id, existing: true });
+  }
+
+  const { data: opp } = await supabaseAdmin
+    .from('opportunities')
+    .select('target_name, platform, target_context, prepared_message')
+    .eq('id', opportunityId)
+    .single();
+
+  const { data: chat } = await supabaseAdmin
+    .from('chats')
+    .insert({
+      user_id:        req.user.id,
+      title:          `Outreach: ${opp?.target_name || opp?.platform || 'prospect'}`,
+      chat_type:      'opportunity',
+      opportunity_id: opportunityId
+    })
+    .select()
+    .single();
+
+  res.json({ chat_id: chat.id, existing: false });
+}));
+
+router.get('/pending-sent-confirmation', asyncHandler(async (req, res) => {
+  const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+
+  const { data } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, platform, target_name, target_context, link_clicked_at, message_copied_at')
+    .eq('user_id', req.user.id)
+    .eq('status', OPPORTUNITY_STATUS.ACTED)
+    .or(`link_clicked_at.gte.${fourHoursAgo},message_copied_at.gte.${fourHoursAgo}`)
+    .order('link_clicked_at', { ascending: false })
+    .limit(5);
+
+  res.json({
+    pending: (data || []).map(opp => ({
+      opportunity_id: opp.id,
+      label:          buildOpportunityLabel(opp),
+      platform:       opp.platform,
+      actioned_at:    opp.link_clicked_at || opp.message_copied_at
+    }))
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/opportunities/:id/intel  — Feature 5
+// Fetches Perplexity-sourced prospect intel and structures it via Groq.
+// Trigger: user button click only. Result is cached for 3 days.
+// ──────────────────────────────────────────
+router.post('/:id/intel', asyncHandler(async (req, res) => {
+  const { data: opp, error: oppErr } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, target_context, target_name, intel_snapshot, intel_generated_at, intel_fetch_failed')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (oppErr || !opp) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Opportunity not found' });
+  }
+
+  // Return cached result if fresh (< 3 days old)
+  const threeDaysAgo = new Date(Date.now() - 3 * 86400000);
+  if (
+    opp.intel_snapshot &&
+    opp.intel_generated_at &&
+    new Date(opp.intel_generated_at) > threeDaysAgo
+  ) {
+    return res.json({ intel: opp.intel_snapshot, cached: true });
+  }
+
+  // Check Perplexity quota — free tier uses the same PERPLEXITY_LIMITS pool
+  const userTier   = req.user.tier || 'free';
+  const usageCheck = await checkPerplexityUsage(req.user.id, userTier);
+
+  if (!usageCheck.allowed) {
+    return res.status(429).json({
+      error:   'QUOTA_EXCEEDED',
+      message: 'Intel lookups used up for today. Resets at midnight.',
+    });
+  }
+
+  try {
+    // Build search query from opportunity context
+    const searchQuery = `${opp.target_context?.slice(0, 400) || ''} recent news funding product launch hiring 2024 2025`.trim();
+
+    let perplexityResult = null;
+
+    // Try Perplexity first. If not configured, fall through to Groq-only mode.
+    try {
+      const { content } = await searchForChat(
+        searchQuery,
+        'Find recent, factual information about this company or person that would be relevant for a sales outreach.'
+      );
+      perplexityResult = content;
+
+      // Track Perplexity usage only when it actually ran
+      await incrementUsage(req.user.id).catch(() => {});
+      const perplexityTokens = Math.ceil(perplexityResult.length / 4);
+      await recordTokenUsage(req.user.id, 'perplexity', 0, perplexityTokens);
+    } catch (perpErr) {
+      if (perpErr.message?.includes('PERPLEXITY_UNAVAILABLE')) {
+        // Perplexity not configured — use Groq with what we already know
+        console.info('[Intel] Perplexity not configured, falling back to Groq-only intel');
+      } else {
+        throw perpErr; // Re-throw real Perplexity errors
+      }
+    }
+
+    // Build the Groq structuring prompt — works with or without Perplexity results
+    const structurePrompt = perplexityResult
+      ? `You are extracting sales-relevant intel about a prospect.
+Given the search results below, extract 3-4 bullet points that would help a founder write a better outreach message.
+Focus on: recent news, funding, growth signals, pain points, relevant context. Be specific and factual.
+
+User's product: ${req.user.product_description || 'not specified'}
+User's target audience: ${req.user.target_audience || 'not specified'}
+Original post context: ${opp.target_context?.slice(0, 500) || ''}
+
+Search results:
+${perplexityResult}
+
+Respond ONLY as JSON:
+{
+  "company": "<company or person name, or null>",
+  "bullets": ["...", "...", "..."],
+  "relevance_note": "<one sentence on why this matters for this specific outreach>"
+}
+If nothing relevant found, return: { "company": null, "bullets": [], "relevance_note": null }`
+      : `You are an expert sales researcher. Based ONLY on the prospect context below,
+extract 3-4 observations that could help a founder write a better outreach message.
+Focus on: what you can infer about their needs, role, company stage, pain points, and why they might respond well.
+
+User's product: ${req.user.product_description || 'not specified'}
+User's target audience: ${req.user.target_audience || 'not specified'}
+Prospect context: ${opp.target_context?.slice(0, 800) || 'No context available'}
+
+Respond ONLY as JSON:
+{
+  "company": "<company or person name extracted from context, or null>",
+  "bullets": ["Observation 1", "Observation 2", "Observation 3"],
+  "relevance_note": "<one sentence on why this specific person is worth reaching out to>"
+}`;
+
+    const { content: structuredContent, tokens_in, tokens_out, model_used } = await callWithFallback({
+      systemPrompt: 'You extract structured sales intel. Return only JSON, no markdown fences.',
+      messages:     [{ role: 'user', content: structurePrompt }],
+      temperature:  0.2,
+      maxTokens:    400,
+    });
+    await recordTokenUsage(req.user.id, 'groq', tokens_in, tokens_out);
+
+    let intel;
+    try {
+      const clean = structuredContent.replace(/```json|```/g, '').trim();
+      intel = JSON.parse(clean);
+    } catch {
+      intel = { company: null, bullets: [], relevance_note: null };
+    }
+
+    // Save intel
+    await supabaseAdmin
+      .from('opportunities')
+      .update({
+        intel_snapshot:     intel,
+        intel_generated_at: new Date().toISOString(),
+        intel_fetch_failed: false,
+      })
+      .eq('id', opp.id);
+
+    return res.json({ intel, cached: false });
+
+  } catch (err) {
+    console.error(`[Intel] Failed for opp ${opp.id}:`, err.message);
+    await supabaseAdmin
+      .from('opportunities')
+      .update({ intel_fetch_failed: true })
+      .eq('id', opp.id);
+
+    return res.status(500).json({ error: 'INTEL_FAILED', message: 'Could not fetch prospect intel right now.' });
+  }
+}));
+
+const extractHandle = (context) => {
+  if (!context) return null;
+  const reddit  = context.match(/u\/([a-zA-Z0-9_-]+)/);
+  if (reddit) return `u/${reddit[1]}`;
+  const twitter = context.match(/@([a-zA-Z0-9_]+)/);
+  if (twitter) return `@${twitter[1]}`;
+  return null;
+};
+
+export default router;

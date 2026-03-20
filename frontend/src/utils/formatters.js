@@ -1,0 +1,147 @@
+import { formatDistanceToNow, format, isToday, isYesterday, isThisYear } from 'date-fns'
+
+// ── Date formatting ──────────────────────────────────────────────────────────
+export const timeAgo = (date) => {
+  if (!date) return ''
+  return formatDistanceToNow(new Date(date), { addSuffix: true })
+}
+
+export const formatDate = (date) => {
+  if (!date) return ''
+  const d = new Date(date)
+  if (isToday(d)) return `Today ${format(d, 'h:mm a')}`
+  if (isYesterday(d)) return `Yesterday ${format(d, 'h:mm a')}`
+  if (isThisYear(d)) return format(d, 'MMM d, h:mm a')
+  return format(d, 'MMM d, yyyy')
+}
+
+export const formatShortDate = (date) => {
+  if (!date) return ''
+  const d = new Date(date)
+  if (isToday(d)) return format(d, 'h:mm a')
+  if (isYesterday(d)) return 'Yesterday'
+  if (isThisYear(d)) return format(d, 'MMM d')
+  return format(d, 'MM/dd/yy')
+}
+
+export const formatEventDate = (date) => {
+  if (!date) return ''
+  return format(new Date(date), 'EEEE, MMMM d · h:mm a')
+}
+
+// ── Number formatting ────────────────────────────────────────────────────────
+export const formatCurrency = (cents, symbol = '$') => {
+  if (!cents) return `${symbol}0`
+  const dollars = cents / 100
+  if (dollars >= 1000) return `${symbol}${(dollars / 1000).toFixed(1)}k`
+  return `${symbol}${dollars.toLocaleString()}`
+}
+
+export const formatDollars = (usd) => {
+  if (!usd) return '$0'
+  if (usd >= 1000) return `$${(usd / 1000).toFixed(1)}k`
+  return `$${usd.toLocaleString()}`
+}
+
+export const formatPercent = (n) => `${Math.round(n || 0)}%`
+
+export const formatNumber = (n) => {
+  if (!n) return '0'
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+// ── String formatting ────────────────────────────────────────────────────────
+export const truncate = (str, max = 100) => {
+  if (!str) return ''
+  if (str.length <= max) return str
+  return str.slice(0, max).trimEnd() + '…'
+}
+
+export const initials = (name) => {
+  if (!name) return '?'
+  return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2)
+}
+
+export const capitalize = (str) => {
+  if (!str) return ''
+  return str.charAt(0).toUpperCase() + str.slice(1).replace(/_/g, ' ')
+}
+
+// ── File size formatting ─────────────────────────────────────────────────────
+export const formatFileSize = (bytes) => {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+// ── Score helpers ────────────────────────────────────────────────────────────
+export const scoreColor = (score) => {
+  if (score >= 8) return '#10B981'
+  if (score >= 5) return '#F59E0B'
+  return '#F43F5E'
+}
+
+export const scoreClass = (score) => {
+  if (score >= 8) return 'score-high'
+  if (score >= 5) return 'score-mid'
+  return 'score-low'
+}
+
+// ── Platform helpers ─────────────────────────────────────────────────────────
+export const platformColor = (platform) => {
+  const colors = {
+    reddit: '#FF4500', twitter: '#1DA1F2', linkedin: '#0A66C2',
+    instagram: '#E1306C', facebook: '#1877F2',
+  }
+  return colors[platform?.toLowerCase()] || '#64748B'
+}
+
+export const platformEmoji = (platform) => {
+  const emojis = {
+    reddit: '🔴', twitter: '🐦', linkedin: '💼',
+    instagram: '📷', facebook: '📘',
+  }
+  return emojis[platform?.toLowerCase()] || '🌐'
+}
+
+// ── Markdown simple renderer (for chat messages) ─────────────────────────────
+// Security: we sanitize the raw text FIRST (strip any injected HTML tags and
+// dangerous protocols) before our own markdown-to-HTML transformation.
+// This prevents XSS via user-supplied or AI-generated content that contains
+// raw <script>, onerror=, javascript: href, or other injection vectors.
+const DANGEROUS_TAGS_RE    = /<\/?(?:script|iframe|object|embed|form|input|svg|math|link|meta|style|base)[^>]*>/gi
+const DANGEROUS_ATTRS_RE   = /\s(?:on\w+|formaction|action|href\s*=\s*["']?\s*javascript)[^=>"'\s]*/gi
+const DANGEROUS_PROTO_RE   = /href=["']?\s*javascript:/gi
+
+const sanitizeRaw = (text) => {
+  if (!text) return ''
+  return text
+    .replace(DANGEROUS_TAGS_RE,    '')
+    .replace(DANGEROUS_ATTRS_RE,   '')
+    .replace(DANGEROUS_PROTO_RE,   'href="#"')
+    // Also strip any bare < > that are not part of our own generated tags
+    // (applied after our transforms so we don't strip our own <strong> etc.)
+}
+
+export const renderMarkdown = (text) => {
+  if (!text) return ''
+  // Step 1 — sanitize raw input before any HTML is generated
+  const safe = sanitizeRaw(text)
+  // Step 2 — apply markdown transforms on the sanitized text
+  const rendered = safe
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/^[-•] (.+)$/gm, '<li>$1</li>')
+    .replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br/>')
+  // Step 3 — strip any injected event handlers that survived transformation
+  return rendered.replace(DANGEROUS_ATTRS_RE, '')
+}

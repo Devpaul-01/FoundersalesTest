@@ -1,0 +1,86 @@
+// src/routes/followup.js
+// ============================================================
+// FOLLOW-UP SEQUENCES — Feature 1
+// Exposes follow-up data and user actions (dismiss / mark sent).
+// The actual follow-up generation is done by the background job
+// in src/jobs/followupSequenceJob.js
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import supabaseAdmin from '../config/supabase.js';
+import { PIPELINE_STAGES } from '../config/constants.js';
+
+const router = Router();
+
+// ──────────────────────────────────────────
+// GET /api/followup
+// List all opportunities with a pending follow-up for this user
+// ──────────────────────────────────────────
+router.get('/', asyncHandler(async (req, res) => {
+  const { data: opps } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, platform, target_name, target_context, stage, follow_up_message, follow_up_count, follow_up_sent_at, marked_sent_at, last_stage_changed_at, composite_score')
+    .eq('user_id', req.user.id)
+    .not('follow_up_message', 'is', null)
+    .in('stage', [PIPELINE_STAGES.CONTACTED, PIPELINE_STAGES.REPLIED, PIPELINE_STAGES.CALL_DEMO])
+    .order('follow_up_sent_at', { ascending: false })
+    .limit(20);
+
+  res.json({ followups: opps || [] });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/followup/:id/dismiss
+// User dismisses a follow-up suggestion — clears the message
+// ──────────────────────────────────────────
+router.post('/:id/dismiss', asyncHandler(async (req, res) => {
+  const { data: opp } = await supabaseAdmin
+    .from('opportunities')
+    .select('id')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!opp) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Opportunity not found' });
+  }
+
+  await supabaseAdmin
+    .from('opportunities')
+    .update({ follow_up_message: null })
+    .eq('id', req.params.id);
+
+  res.json({ success: true });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/followup/:id/sent
+// User confirms they sent the follow-up — updates stage timestamp
+// ──────────────────────────────────────────
+router.post('/:id/sent', asyncHandler(async (req, res) => {
+  const { data: opp } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, stage')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!opp) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Opportunity not found' });
+  }
+
+  // Clear the follow-up message and reset stage timer so next nudge
+  // won't fire immediately
+  await supabaseAdmin
+    .from('opportunities')
+    .update({
+      follow_up_message:     null,
+      last_stage_changed_at: new Date().toISOString(),
+    })
+    .eq('id', req.params.id);
+
+  res.json({ success: true });
+}));
+
+export default router;

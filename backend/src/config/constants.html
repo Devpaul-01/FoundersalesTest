@@ -1,0 +1,425 @@
+// src/config/constants.js  (also used in frontend via src/utils/constants.js)
+// ============================================================
+// CLUTCH AI - CENTRAL CONSTANTS V2
+// Single source of truth for all limits, enums, and config.
+// ============================================================
+
+// ── Tiers ─────────────────────────────────────────────────────────────────────
+export const TIERS = {
+  FREE: 'free',
+  PRO: 'pro',
+  ENTERPRISE: 'enterprise'
+};
+
+
+// ── Perplexity limits ─────────────────────────────────────────────────────────
+// Single source of truth — keyed by TIERS values.
+// Adjust values here when needed; do NOT add duplicate standalone constants.
+// free: 2 per Feature 5 refinement (Prospect Quick Intel).
+export const PERPLEXITY_LIMITS = {
+  [TIERS.FREE]:       2,
+  [TIERS.PRO]:        20,
+  [TIERS.ENTERPRISE]: 30,
+};
+
+export const PERPLEXITY_GLOBAL_DAILY_CAP       = 500;
+export const PERPLEXITY_COST_PER_CALL_CENTS    = 5;
+export const PERPLEXITY_GLOBAL_DAILY_CAP_TOKENS = 2_000_000;
+
+// TOKEN LIMITS — Perplexity charges per token; Groq is free (no limits).
+export const PERPLEXITY_TOKEN_LIMITS = {
+  [TIERS.FREE]:       50_000,       // ~2 searches/day worth
+  [TIERS.PRO]:       500_000,       // ~20 searches/day worth
+  [TIERS.ENTERPRISE]: 9_999_999,
+};
+
+export const GROQ_LIMITS = {
+  [TIERS.FREE]:       Infinity,
+  [TIERS.PRO]:        Infinity,
+  [TIERS.ENTERPRISE]: Infinity,
+};
+
+// Approximate cost in cents per 1000 tokens (for dashboard display)
+export const COST_PER_1K_TOKENS = {
+  perplexity_sonar_pro: 0.1,  // $1 per 1M tokens input, rough estimate
+  groq: 0,                    // Free
+};
+
+// ── Model names ───────────────────────────────────────────────────────────────
+export const MODELS = {
+  GROQ:       process.env.GROQ_MODEL       || 'llama-3.1-8b-instant',
+  PERPLEXITY: process.env.PERPLEXITY_MODEL || 'sonar-pro',
+};
+
+// ── Pipeline stages ───────────────────────────────────────────────────────────
+export const PIPELINE_STAGES = {
+  NEW:         'new',
+  CONTACTED:   'contacted',
+  REPLIED:     'replied',
+  CALL_DEMO:   'call_demo',
+  CLOSED_WON:  'closed_won',
+  CLOSED_LOST: 'closed_lost',
+};
+
+export const PIPELINE_STAGE_VALUES = Object.values(PIPELINE_STAGES);
+
+export const STAGE_LABELS = {
+  new:         'New',
+  contacted:   'Contacted',
+  replied:     'Replied',
+  call_demo:   'Call / Demo',
+  closed_won:  'Closed Won',
+  closed_lost: 'Closed Lost',
+};
+
+export const STAGE_COLORS = {
+  new:         '#64748B',
+  contacted:   '#3B82F6',
+  replied:     '#8B5CF6',
+  call_demo:   '#F59E0B',
+  closed_won:  '#10B981',
+  closed_lost: '#F43F5E',
+};
+
+// ── Opportunity status ────────────────────────────────────────────────────────
+export const OPP_STATUS = {
+  PENDING: 'pending',
+  VIEWED:  'viewed',
+  ACTED:   'acted',
+  SENT:    'sent',
+  DONE:    'done',
+};
+
+export const OPPORTUNITY_STATUS = OPP_STATUS;
+
+// ── Feedback outcomes ─────────────────────────────────────────────────────────
+export const FEEDBACK_OUTCOMES = {
+  POSITIVE: 'positive',
+  NEGATIVE: 'negative',
+};
+
+// ── Chat types ────────────────────────────────────────────────────────────────
+export const CHAT_TYPES = {
+  GENERAL:     'general',
+  OPPORTUNITY: 'opportunity',
+  PRACTICE:    'practice',
+};
+
+// ── Message delivery states ───────────────────────────────────────────────────
+export const DELIVERY_STATUS = {
+  PENDING:   'pending',
+  DELIVERED: 'delivered',
+  SEEN:      'seen',
+  REPLIED:   'replied',
+  GHOSTED:   'ghosted',
+};
+
+// ── Practice scenarios ────────────────────────────────────────────────────────
+export const PRACTICE_SCENARIOS = [
+  { type: 'interested',       weight: 25, label: 'Interested Lead',    reply_delay_range: [30, 120]  },
+  { type: 'polite_decline',   weight: 25, label: 'Polite No',          reply_delay_range: [60, 300]  },
+  { type: 'ghost',            weight: 20, label: 'No Response',        reply_delay_range: null       },
+  { type: 'skeptical',        weight: 15, label: 'Skeptical Response', reply_delay_range: [45, 180]  },
+  { type: 'price_objection',  weight: 10, label: 'Price Concern',      reply_delay_range: [120, 400] },
+  { type: 'not_right_time',   weight: 5,  label: 'Bad Timing',         reply_delay_range: [90, 240]  },
+];
+
+// Ghost timeout: if no reply in this many seconds, mark as ghosted
+export const GHOST_TIMEOUT_SECONDS = 600; // 10 minutes in practice mode
+
+export const SCENARIO_LABELS = {
+  interested:      'Interested',
+  polite_decline:  'Polite Decline',
+  ghost:           'Ghost',
+  skeptical:       'Skeptical',
+  price_objection: 'Price Objection',
+  not_right_time:  'Not Right Time',
+};
+
+export const SCENARIO_COLORS = {
+  interested:      '#10B981',
+  polite_decline:  '#F59E0B',
+  ghost:           '#64748B',
+  skeptical:       '#F43F5E',
+  price_objection: '#8B5CF6',
+  not_right_time:  '#0EA5E9',
+};
+
+// ── Opportunity feed ──────────────────────────────────────────────────────────
+export const OPPORTUNITIES_PER_RUN = 8;
+export const MIN_COMPOSITE_SCORE   = 5;
+
+// ── Follow-up sequence thresholds (days of inactivity per stage) ──────────────
+export const FOLLOW_UP_THRESHOLDS = {
+  contacted: 4,
+  replied:   6,
+  call_demo: 3,
+};
+
+// ── Email digest ──────────────────────────────────────────────────────────────
+export const EMAIL_DIGEST_FROM = process.env.EMAIL_DIGEST_FROM || 'Clutch AI <coach@clutch.ai>';
+
+// ── Intel (Prospect Quick Intel) daily limits ─────────────────────────────────
+// Shared with opportunity-search quota via checkPerplexityUsage.
+// Free users get 2 Perplexity calls/day total (search + intel combined).
+export const INTEL_DAILY_LIMITS = {
+  [TIERS.FREE]:       2,
+  [TIERS.PRO]:        Infinity,
+  [TIERS.ENTERPRISE]: Infinity,
+};
+
+// ── Goal nudge ────────────────────────────────────────────────────────────────
+export const GOAL_NUDGE_MIN_DAYS     = 3;   // Min days between nudges per goal
+export const GOAL_NUDGE_STALE_DAYS   = 5;   // Days since last note before nudge
+export const GOAL_NUDGE_DEADLINE_DAYS = 7;  // Days to deadline that triggers nudge
+
+// ── Background job intervals ──────────────────────────────────────────────────
+export const JOB_INTERVALS = {
+  MESSAGE_QUEUE_WORKER:  '*/30 * * * * *',  // Every 30 seconds (6-field cron)
+  OPPORTUNITY_FETCH:     '0 */6 * * *',      // Every 6 hours
+  FEEDBACK_PROMPTS:      '0 * * * *',        // Every hour
+  PERFORMANCE_SUMMARY:   '0 2 * * *',        // 2am daily
+  METRICS_AGGREGATION:   '0 3 * * *',        // 3am daily
+  CALENDAR_PREP:         '0 8 * * *',        // 8am daily
+  DAILY_TIP_GENERATION:  '0 7 * * *',        // 7am daily
+  CHECK_IN_SCHEDULER:    '0 14 * * *',       // 2pm daily, schedules 3pm check-ins
+  WEEKLY_PLAN:           '0 18 * * 0',       // 6pm Sunday
+  FOLLOW_UP_CHECK:       '0 10 * * *',       // 10am daily — follow-up sequence job
+  MEMORY_EXTRACTION:     '*/30 * * * *',     // Every 30 minutes — cross-session AI memory
+  EMAIL_DIGEST:          '0 18 * * 0',       // Sunday 6pm — weekly email digest
+  GOAL_NUDGE_CHECK:      '0 9 * * *',        // 9am daily — goal nudge job
+};
+
+// ── Background job types ──────────────────────────────────────────────────────
+export const QUEUE_JOB_TYPES = {
+  PRACTICE_DELIVERED:     'practice_delivered',
+  PRACTICE_SEEN:          'practice_seen',
+  PRACTICE_REPLY:         'practice_reply',
+  PRACTICE_GHOST:         'practice_ghost',
+  DAILY_TIP_GENERATION:   'daily_tip_generation',
+  WEEKLY_STRATEGY_BRIEF:  'weekly_strategy_brief',
+  CHECK_IN_PROMPT:        'check_in_prompt',
+  GROWTH_CARD_GENERATION: 'growth_card_generation',
+  ARCHETYPE_DETECTION:    'archetype_detection',
+};
+
+// ── Feedback / pipeline timing ────────────────────────────────────────────────
+// Hybrid UX: prompt user 30 seconds after link click
+export const SENT_PROMPT_DELAY_MS       = 30000;
+// Feedback prompt: 48 hours after marking sent
+export const FEEDBACK_PROMPT_DELAY_HOURS = 48;
+
+// ── Performance summarization ─────────────────────────────────────────────────
+export const MIN_MESSAGES_FOR_SUMMARY   = 10;
+export const SUMMARIZE_EVERY_N_MESSAGES = 5;
+
+// ── Batch processing ──────────────────────────────────────────────────────────
+export const BATCH_SIZE     = 5;
+export const BATCH_DELAY_MS = 2000;
+
+// ── File uploads ──────────────────────────────────────────────────────────────
+export const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+export const ALLOWED_FILE_TYPES = [
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+  'application/pdf',
+  'text/plain',
+  'text/csv',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+
+// ── Calendar prep ─────────────────────────────────────────────────────────────
+export const CALENDAR_PREP_HOURS_BEFORE = 24; // Prep 24h before event
+
+// ── Onboarding ────────────────────────────────────────────────────────────────
+export const USER_ROLES       = ['founder', 'sales', 'freelancer', 'marketer', 'developer', 'other'];
+export const INDUSTRIES       = ['saas', 'ecommerce', 'services', 'fintech', 'health', 'education', 'other'];
+export const EXPERIENCE_LEVELS = ['beginner', 'intermediate', 'advanced'];
+export const OUTREACH_GOALS   = ['get_customers', 'find_investors', 'partnerships', 'feedback', 'hiring'];
+export const PLATFORMS        = ['reddit', 'linkedin', 'twitter', 'facebook', 'instagram', 'email', 'other'];
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+export const ROUTES = {
+  LOGIN:            '/login',
+  REGISTER:         '/register',
+  FORGOT_PASSWORD:  '/forgot-password',
+  RESET_PASSWORD:   '/reset-password',
+  ONBOARDING:       '/onboarding',
+  DASHBOARD:        '/dashboard',
+  GROWTH:           '/growth',
+  OPPORTUNITIES:    '/opportunities',
+  PIPELINE:         '/pipeline',
+  CHAT:             '/chat',
+  PRACTICE:         '/practice',
+  CALENDAR:         '/calendar',
+  METRICS:          '/metrics',
+  SETTINGS:         '/settings',
+  GOALS:            '/goals',
+};
+
+// ── Archetypes ────────────────────────────────────────────────────────────────
+export const ARCHETYPES = {
+  SELLER:       'seller',
+  BUILDER:      'builder',
+  FREELANCER:   'freelancer',
+  CREATOR:      'creator',
+  PROFESSIONAL: 'professional',
+  LEARNER:      'learner',
+};
+
+export const ARCHETYPE_LABELS = {
+  seller:       'Seller',
+  builder:      'Builder',
+  freelancer:   'Freelancer',
+  creator:      'Creator',
+  professional: 'Professional',
+  learner:      'Learner',
+};
+
+export const ARCHETYPE_DESCRIPTIONS = {
+  seller:       'You sell a product or service to businesses or consumers',
+  builder:      'You\'re building something new and looking for your first customers',
+  freelancer:   'You offer skills or services to clients on a project basis',
+  creator:      'You create content, art, or media and want to grow your audience or monetize',
+  professional: 'You\'re growing your career, network, or professional reputation',
+  learner:      'You\'re developing new skills or transitioning to a new field',
+};
+
+export const ARCHETYPE_ICONS = {
+  seller:       '💼',
+  builder:      '🔨',
+  freelancer:   '🎯',
+  creator:      '✨',
+  professional: '🏆',
+  learner:      '📚',
+};
+
+// ── Supported platforms ───────────────────────────────────────────────────────
+export const SUPPORTED_PLATFORMS = {
+  REDDIT:       'reddit',
+  LINKEDIN:     'linkedin',
+  TWITTER:      'twitter',
+  FACEBOOK:     'facebook',
+  INSTAGRAM:    'instagram',
+  PRODUCTHUNT:  'producthunt',
+  INDIEHACKERS: 'indiehackers',
+  HACKERNEWS:   'hackernews',
+  QUORA:        'quora',
+  YOUTUBE:      'youtube',
+};
+
+export const PLATFORM_LABELS = {
+  reddit:       'Reddit',
+  linkedin:     'LinkedIn',
+  twitter:      'X / Twitter',
+  facebook:     'Facebook',
+  instagram:    'Instagram',
+  producthunt:  'Product Hunt',
+  indiehackers: 'Indie Hackers',
+  hackernews:   'Hacker News',
+  quora:        'Quora',
+  youtube:      'YouTube',
+};
+
+export const PLATFORM_ICONS = {
+  reddit:       '🟠',
+  linkedin:     '💼',
+  twitter:      '🐦',
+  facebook:     '📘',
+  instagram:    '📸',
+  producthunt:  '🚀',
+  indiehackers: '👨‍💻',
+  hackernews:   '🔶',
+  quora:        '❓',
+  youtube:      '▶️',
+};
+
+export const PLATFORM_COLORS = {
+  reddit:       '#FF4500',
+  linkedin:     '#0A66C2',
+  twitter:      '#1DA1F2',
+  facebook:     '#1877F2',
+  instagram:    '#E1306C',
+  producthunt:  '#DA552F',
+  indiehackers: '#0E2233',
+  hackernews:   '#FF6600',
+  quora:        '#B92B27',
+  youtube:      '#FF0000',
+  other:        '#64748B',
+};
+
+// Archetype → recommended platforms for discovery
+export const ARCHETYPE_PLATFORM_DEFAULTS = {
+  seller:       ['reddit', 'linkedin', 'twitter'],
+  builder:      ['reddit', 'indiehackers', 'hackernews'],
+  freelancer:   ['linkedin', 'reddit', 'twitter'],
+  creator:      ['instagram', 'twitter', 'youtube'],
+  professional: ['linkedin', 'twitter', 'reddit'],
+  learner:      ['reddit', 'twitter', 'linkedin'],
+};
+
+// ── Growth card types ─────────────────────────────────────────────────────────
+export const GROWTH_CARD_TYPES = {
+  TIP:        'tip',
+  STRATEGY:   'strategy',
+  RESOURCE:   'resource',
+  REFLECTION: 'reflection',
+  CHALLENGE:  'challenge',
+  COMMUNITY:  'community',
+  INSIGHT:    'insight',
+};
+
+export const GROWTH_CARD_LABELS = {
+  tip:        'Daily Tip',
+  strategy:   'Strategy',
+  resource:   'Resource',
+  reflection: 'Reflection',
+  challenge:  'Challenge',
+  community:  'Community',
+  insight:    'Insight',
+};
+
+export const GROWTH_CARD_ICONS = {
+  tip:        '💡',
+  strategy:   '🗺️',
+  resource:   '📖',
+  reflection: '🪞',
+  challenge:  '⚡',
+  community:  '👥',
+  insight:    '✨',
+};
+
+// ── Default notification preferences ─────────────────────────────────────────
+export const DEFAULT_NOTIFICATION_PREFS = {
+  new_opportunities:   true,
+  feedback_reminders:  true,
+  practice_replies:    true,
+  calendar_prep_ready: true,
+  daily_tip:           true,
+  check_in_prompt:     true,
+  weekly_plan:         true,
+};
+
+// ── Chat suggestion chips (archetype-aware defaults) ─────────────────────────
+export const DEFAULT_CHAT_SUGGESTIONS = [
+  'Help me write a better cold message',
+  'Why am I getting ghosted?',
+  'Review my outreach approach',
+  'What should I say after no response?',
+  'Help me handle a price objection',
+];
+
+export const ARCHETYPE_CHAT_SUGGESTIONS = {
+  seller:       ['Help me write a cold message', 'Why am I getting ghosted?', 'Review my pitch', 'Handle a price objection'],
+  builder:      ['How do I validate my idea?', 'Find my first 10 customers', 'What\'s my ICP?', 'How do I get feedback?'],
+  freelancer:   ['Write a proposal for a new client', 'How do I price my services?', 'Deal with a difficult client', 'Land my next project'],
+  creator:      ['How do I grow my audience?', 'Pitch a brand deal', 'Improve my content strategy', 'Monetize my following'],
+  professional: ['Improve my LinkedIn profile', 'Network with someone new', 'Ask for a promotion', 'Build my personal brand'],
+  learner:      ['Where do I start with sales?', 'Explain cold outreach simply', 'Practice a pitch with me', 'Best resources to learn from'],
+};
+export const UPLOAD_LIMITS = {
+  MAX_SIZE_BYTES:  MAX_FILE_SIZE,
+  ALLOWED_TYPES:   ALLOWED_FILE_TYPES,
+  SUPABASE_BUCKET: 'clutch-uploads',
+};

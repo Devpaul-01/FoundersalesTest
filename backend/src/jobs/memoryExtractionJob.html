@@ -1,0 +1,311 @@
+// src/jobs/memoryExtractionJob.js
+// ============================================================
+// FEATURE 2: CROSS-SESSION AI MEMORY — EXTRACTION JOB
+// Runs every 30 minutes.
+// Processes chats with >= 10 messages that have new activity
+// since last extraction, extracts key founder facts via Groq,
+// deduplicates against existing memory, and upserts the result.
+//
+// DB requirements (run before first use):
+//   ALTER TABLE chats
+//     ADD COLUMN IF NOT EXISTS memory_last_extracted_at timestamptz;
+//
+//   ALTER TABLE users
+//     ADD COLUMN IF NOT EXISTS memory_enabled boolean DEFAULT true;
+//
+//   CREATE TABLE user_memory (
+//     id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+//     user_id             uuid REFERENCES users(id) ON DELETE CASCADE,
+//     fact                text NOT NULL,
+//     source_chat_id      uuid REFERENCES chats(id) ON DELETE SET NULL,
+//     reinforcement_count integer DEFAULT 1,
+//     last_reinforced_at  timestamptz DEFAULT now(),
+//     is_active           boolean DEFAULT true,
+//     created_at          timestamptz DEFAULT now()
+//   );
+//   CREATE INDEX idx_user_memory_user   ON user_memory(user_id, is_active);
+//   CREATE INDEX idx_user_memory_source ON user_memory(source_chat_id);
+// ============================================================
+
+import supabaseAdmin from '../config/supabase.js';
+import { callWithFallback } from '../services/multiProvider.js';
+import { recordTokenUsage } from '../services/tokenTracker.js';
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const MEMORY_CAP = 30; // max active facts per user
+const BATCH_SIZE = 10;
+
+const logJob = async (name, status, data = {}) => {
+  await supabaseAdmin.from('job_logs').insert({ job_name: name, status, ...data }).catch(() => {});
+};
+
+// ──────────────────────────────────────────
+// MAIN JOB ENTRY POINT
+// ──────────────────────────────────────────
+export const runMemoryExtractionJob = async () => {
+  const startTime = Date.now();
+  console.log(`[MemoryJob] Starting ${new Date().toISOString()}`);
+
+  try {
+    // Find chats needing extraction:
+    // - 10+ messages
+    // - new activity since last extraction
+    // - user has memory_enabled = true (or null = default true)
+    const { data: chats } = await supabaseAdmin
+      .from('chats')
+      .select(`
+        id, user_id, message_count, last_message_at, memory_last_extracted_at,
+        users!inner(id, is_deleted, memory_enabled)
+      `)
+      .gte('message_count', 10)
+      .eq('is_archived', false)
+      .eq('users.is_deleted', false)
+      .or('users.memory_enabled.is.null,users.memory_enabled.eq.true')
+      .or('memory_last_extracted_at.is.null,last_message_at.gt.memory_last_extracted_at')
+      .limit(BATCH_SIZE);
+
+    if (!chats?.length) {
+      console.log('[MemoryJob] No chats need extraction');
+      return;
+    }
+
+    console.log(`[MemoryJob] Processing ${chats.length} chats`);
+    let processed = 0;
+
+    for (const chat of chats) {
+      try {
+        await extractMemoryForChat(chat);
+        processed++;
+      } catch (err) {
+        console.error(`[MemoryJob] Failed for chat ${chat.id}:`, err.message);
+      }
+      await sleep(1500);
+    }
+
+    await logJob('memory_extraction', 'completed', { processed, duration_ms: Date.now() - startTime });
+    console.log(`[MemoryJob] Done — ${processed} chats processed`);
+
+  } catch (err) {
+    console.error('[MemoryJob] Fatal:', err.message);
+    await logJob('memory_extraction', 'failed', { error_message: err.message });
+  }
+};
+
+// ──────────────────────────────────────────
+// EXTRACT MEMORY FOR ONE CHAT
+// ──────────────────────────────────────────
+const extractMemoryForChat = async (chat) => {
+  const userId = chat.user_id;
+
+  // Fetch last 20 messages
+  const { data: messages } = await supabaseAdmin
+    .from('chat_messages')
+    .select('role, content')
+    .eq('chat_id', chat.id)
+    .in('role', ['user', 'assistant'])
+    .order('created_at', { ascending: false })
+    .limit(20);
+
+  if (!messages?.length) return;
+
+  const transcript = messages
+    .reverse()
+    .map(m => `${m.role === 'user' ? 'Founder' : 'AI'}: ${m.content}`)
+    .join('\n');
+
+  // Step 1: Extract facts
+  const extractionPrompt = `You are a fact extraction system. Extract key facts about this founder and their business that would help an AI coach give better advice in future conversations.
+Only extract facts that are:
+- Specific and actionable (not generic)
+- About the user's business, product, audience, challenges, style preferences, or patterns
+- Worth remembering across multiple future sessions
+
+Do NOT extract: temporary states, one-off events, things that will change weekly.
+DO extract: who they sell to, what works/doesn't, their communication style, key challenges, product details, audience characteristics.
+
+Respond ONLY as a JSON array of strings. Maximum 5 facts. If there's nothing worth extracting, return [].
+
+User message history:
+${transcript}`;
+
+  const { content: extractContent, tokens_in: eIn, tokens_out: eOut, model_used } = await callWithFallback({
+    systemPrompt: 'You extract founder facts from conversation history. Return only JSON arrays.',
+    messages:     [{ role: 'user', content: extractionPrompt }],
+    temperature:  0.2,
+    maxTokens:    400,
+  });
+
+  await recordTokenUsage(userId, 'groq', eIn, eOut);
+
+  let newFacts;
+  try {
+    const clean = extractContent.replace(/```json|```/g, '').trim();
+    newFacts = JSON.parse(clean);
+    if (!Array.isArray(newFacts)) throw new Error('Not an array');
+  } catch {
+    newFacts = [];
+  }
+
+  // Mark chat as processed regardless of fact count
+  await supabaseAdmin
+    .from('chats')
+    .update({ memory_last_extracted_at: new Date().toISOString() })
+    .eq('id', chat.id);
+
+  if (!newFacts.length) return; // Skip dedup if nothing to insert
+
+  // Fetch existing active memory
+  const { data: existing } = await supabaseAdmin
+    .from('user_memory')
+    .select('id, fact, reinforcement_count, last_reinforced_at')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .order('reinforcement_count', { ascending: false });
+
+  const existingFacts = existing || [];
+
+  // Step 2: Deduplicate (skip if no existing facts)
+  let decisions;
+  if (existingFacts.length === 0) {
+    decisions = newFacts.map(f => ({ fact: f, action: 'insert', replace_id: null }));
+  } else {
+    const existingList = existingFacts.map((f, i) => `${i + 1}. ${f.fact}`).join('\n');
+    const newList      = newFacts.map((f, i) => `${String.fromCharCode(65 + i)}. ${f}`).join('\n');
+
+    const dedupPrompt = `You are a memory deduplication system.
+
+EXISTING FACTS (numbered):
+${existingList}
+
+NEW FACTS TO EVALUATE (lettered):
+${newList}
+
+For each new fact, decide:
+- "skip" — semantically identical or covered by an existing fact
+- "replace" — similar to an existing fact but the new version is more specific or updated. Provide the ID of the fact to replace.
+- "insert" — genuinely new information not covered by any existing fact
+
+Respond ONLY as a JSON array:
+[{ "fact": "...", "action": "skip"|"replace"|"insert", "replace_id": <1-based number or null> }]`;
+
+    try {
+      const { content: dedupContent, tokens_in: dIn, tokens_out: dOut } = await callWithFallback({
+        systemPrompt: 'You deduplicate memory facts. Return only a JSON array.',
+        messages:     [{ role: 'user', content: dedupPrompt }],
+        temperature:  0.1,
+        maxTokens:    500,
+      });
+      await recordTokenUsage(userId, 'groq', dIn, dOut);
+
+      const clean = dedupContent.replace(/```json|```/g, '').trim();
+      decisions = JSON.parse(clean);
+      if (!Array.isArray(decisions)) throw new Error('Not an array');
+    } catch (err) {
+      console.warn(`[MemoryJob] Dedup failed for user ${userId}, inserting without dedup:`, err.message);
+      // Fallback: insert all new facts without deduplication
+      decisions = newFacts.map(f => ({ fact: f, action: 'insert', replace_id: null }));
+    }
+  }
+
+  // Step 3: Apply decisions
+  for (const decision of decisions) {
+    try {
+      if (decision.action === 'skip' && decision.replace_id) {
+        // Reinforce existing fact
+        const target = existingFacts[decision.replace_id - 1];
+        if (target) {
+          await supabaseAdmin
+            .from('user_memory')
+            .update({
+              reinforcement_count: (target.reinforcement_count || 1) + 1,
+              last_reinforced_at:  new Date().toISOString(),
+            })
+            .eq('id', target.id);
+        }
+      } else if (decision.action === 'replace' && decision.replace_id) {
+        const target = existingFacts[decision.replace_id - 1];
+        if (target) {
+          await supabaseAdmin
+            .from('user_memory')
+            .update({
+              fact:                decision.fact,
+              reinforcement_count: (target.reinforcement_count || 1) + 1,
+              last_reinforced_at:  new Date().toISOString(),
+            })
+            .eq('id', target.id);
+        }
+      } else if (decision.action === 'insert') {
+        // Evict if at cap
+        const activeCount = existingFacts.filter(f => f.is_active !== false).length;
+        if (activeCount >= MEMORY_CAP) {
+          await evictLowestPriorityFact(userId, existingFacts);
+        }
+        await supabaseAdmin.from('user_memory').insert({
+          user_id:        userId,
+          fact:           decision.fact,
+          source_chat_id: chat.id,
+        });
+      }
+    } catch (err) {
+      console.warn(`[MemoryJob] Decision apply failed for user ${userId}:`, err.message);
+    }
+  }
+};
+
+// ──────────────────────────────────────────
+// EVICT LOWEST-PRIORITY FACT
+// Priority = (reinforcement_count × 3) + (recency_score × 1) + (source_diversity × 2)
+// source_diversity = number of distinct chat types that mentioned this fact, capped at 3
+// We approximate source_diversity by fetching it from the DB for the full user memory set.
+// ──────────────────────────────────────────
+const evictLowestPriorityFact = async (userId, facts) => {
+  const now = Date.now();
+
+  // Fetch source_chat_id for all facts so we can query their chat types
+  const factIds = facts.map(f => f.id);
+  const { data: fullFacts } = await supabaseAdmin
+    .from('user_memory')
+    .select('id, reinforcement_count, last_reinforced_at, source_chat_id')
+    .in('id', factIds)
+    .eq('is_active', true);
+
+  // Build a map of chat_id → chat_type for any source_chat_ids we have
+  const chatIds = [...new Set((fullFacts || []).map(f => f.source_chat_id).filter(Boolean))];
+  let chatTypeMap = {};
+  if (chatIds.length > 0) {
+    const { data: chats } = await supabaseAdmin
+      .from('chats')
+      .select('id, chat_type')
+      .in('id', chatIds);
+    (chats || []).forEach(c => { chatTypeMap[c.id] = c.chat_type; });
+  }
+
+  // Group facts by original id for source_diversity lookup
+  const fullFactMap = {};
+  (fullFacts || []).forEach(f => { fullFactMap[f.id] = f; });
+
+  const scored = facts.map(f => {
+    const ff           = fullFactMap[f.id] || f;
+    const daysSince    = (now - new Date(ff.last_reinforced_at || Date.now()).getTime()) / 86400000;
+    const recencyScore = Math.min(10, 10 / Math.max(daysSince, 0.1));
+
+    // source_diversity: number of distinct chat_types that sourced this fact, capped at 3
+    // We approximate per-fact diversity as 1 if we know the source type, 0 if not.
+    // A full implementation would track all source_chat_ids per fact; here we use what we have.
+    const sourceChatType  = ff.source_chat_id ? chatTypeMap[ff.source_chat_id] : null;
+    const sourceDiversity = sourceChatType ? 1 : 0; // 0–3 cap; 1 is a reasonable proxy for new facts
+
+    const priority = (ff.reinforcement_count * 3) + (recencyScore * 1) + (sourceDiversity * 2);
+    return { ...f, priority };
+  });
+
+  scored.sort((a, b) => a.priority - b.priority);
+  const toEvict = scored[0];
+
+  if (toEvict) {
+    await supabaseAdmin
+      .from('user_memory')
+      .update({ is_active: false })
+      .eq('id', toEvict.id);
+  }
+};

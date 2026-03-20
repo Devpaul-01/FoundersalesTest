@@ -1,0 +1,24 @@
+import { create } from 'zustand'
+
+export const usePracticeStore = create((set, get) => ({
+  activeSession: null,
+  activeChatId: null,
+  deliveryStatuses: {},     // messageId → 'sent' | 'delivered' | 'seen' | 'replied' | 'ghosted'
+  isProspectTyping: false,
+
+  setSession: (session) => set({ activeSession: session }),
+  setChatId: (chatId) => set({ activeChatId: chatId }),
+
+  updateDelivery: (messageId, status) => set((state) => ({
+    deliveryStatuses: { ...state.deliveryStatuses, [messageId]: status }
+  })),
+
+  setProspectTyping: (typing) => set({ isProspectTyping: typing }),
+
+  clearSession: () => set({
+    activeSession: null,
+    activeChatId: null,
+    deliveryStatuses: {},
+    isProspectTyping: false,
+  }),
+}))

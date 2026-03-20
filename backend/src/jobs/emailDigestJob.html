@@ -1,0 +1,381 @@
+// src/jobs/emailDigestJob.js
+// ============================================================
+// FEATURE 3: WEEKLY EMAIL DIGEST
+// Runs every Sunday at 6pm.
+// Sends a personalised weekly summary email to each user.
+//
+// Email delivery: Google SMTP first → Resend as fallback.
+// Install: npm install resend nodemailer
+//
+// .env vars needed:
+//   GMAIL_USER=your@gmail.com
+//   GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx   (Google App Password)
+//   RESEND_API_KEY=re_...
+//   EMAIL_DIGEST_FROM=Clutch AI <coach@clutch.ai>
+//   FRONTEND_URL=https://yourapp.com
+//
+// DB requirements (run before first use):
+//   ALTER TABLE users
+//     ADD COLUMN IF NOT EXISTS email_digest_enabled boolean DEFAULT true,
+//     ADD COLUMN IF NOT EXISTS last_digest_sent_at  timestamptz,
+//     ADD COLUMN IF NOT EXISTS digest_email         text;
+// ============================================================
+
+import supabaseAdmin from '../config/supabase.js';
+import { callWithFallback } from '../services/multiProvider.js';
+import { recordTokenUsage } from '../services/tokenTracker.js';
+import { EMAIL_DIGEST_FROM, BATCH_DELAY_MS } from '../config/constants.js';
+import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const BATCH_SIZE = 10;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://app.clutch.ai';
+
+const logJob = async (name, status, data = {}) => {
+  await supabaseAdmin.from('job_logs').insert({ job_name: name, status, ...data }).catch(() => {});
+};
+
+// ──────────────────────────────────────────
+// BUILD SMTP / RESEND CLIENTS LAZILY
+// ──────────────────────────────────────────
+let gmailTransport = null;
+let resendClient   = null;
+
+const getGmailTransport = () => {
+  if (!gmailTransport && process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    gmailTransport = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false,
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD,
+      },
+    });
+  }
+  return gmailTransport;
+};
+
+const getResendClient = () => {
+  if (!resendClient && process.env.RESEND_API_KEY) {
+    resendClient = new Resend(process.env.RESEND_API_KEY);
+  }
+  return resendClient;
+};
+
+// ──────────────────────────────────────────
+// MAIN JOB ENTRY POINT
+// ──────────────────────────────────────────
+export const runEmailDigestJob = async () => {
+  const startTime = Date.now();
+  console.log(`[EmailDigest] Starting ${new Date().toISOString()}`);
+  await logJob('email_digest', 'started');
+
+  let sent = 0, failed = 0;
+
+  try {
+    const { data: users } = await supabaseAdmin
+      .from('users')
+      .select('id, name, email, digest_email, archetype, product_description, target_audience, email_digest_enabled')
+      .eq('onboarding_completed', true)
+      .eq('is_deleted', false)
+      .eq('email_digest_enabled', true)
+      .not('email', 'is', null);
+
+    if (!users?.length) {
+      await logJob('email_digest', 'completed', { sent: 0, failed: 0, duration_ms: Date.now() - startTime });
+      return;
+    }
+
+    console.log(`[EmailDigest] Sending to ${users.length} users`);
+
+    // Process in batches
+    for (let i = 0; i < users.length; i += BATCH_SIZE) {
+      const batch = users.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(batch.map(user => sendDigestForUser(user)));
+      results.forEach((r, idx) => {
+        if (r.status === 'fulfilled') sent++;
+        else {
+          failed++;
+          console.error(`[EmailDigest] Failed for ${batch[idx].email}:`, r.reason?.message);
+        }
+      });
+      if (i + BATCH_SIZE < users.length) await sleep(BATCH_DELAY_MS);
+    }
+
+    await logJob('email_digest', 'completed', { sent, failed, duration_ms: Date.now() - startTime });
+    console.log(`[EmailDigest] Done — ${sent} sent, ${failed} failed`);
+
+  } catch (err) {
+    console.error('[EmailDigest] Fatal:', err.message);
+    await logJob('email_digest', 'failed', { error_message: err.message, duration_ms: Date.now() - startTime });
+  }
+};
+
+// ──────────────────────────────────────────
+// SEND DIGEST FOR ONE USER
+// ──────────────────────────────────────────
+const sendDigestForUser = async (user) => {
+  const toEmail  = user.digest_email || user.email;
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+  const today        = new Date().toISOString().split('T')[0];
+
+  // Gather weekly stats in parallel
+  const [metricsResult, goalsResult, pipelineResult, perfResult] = await Promise.allSettled([
+    supabaseAdmin
+      .from('daily_metrics')
+      .select('messages_sent, positive_outcomes, opportunities_shown')
+      .eq('user_id', user.id)
+      .gte('date', sevenDaysAgo)
+      .lte('date', today),
+    supabaseAdmin
+      .from('user_goals')
+      .select('goal_text, current_value, target_value, target_unit, status')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .limit(2),
+    supabaseAdmin
+      .from('opportunities')
+      .select('stage, deal_value')
+      .eq('user_id', user.id)
+      .not('stage', 'in', '("new","closed_lost")'),
+    supabaseAdmin
+      .from('user_performance_profiles')
+      .select('positive_rate, total_sent')
+      .eq('user_id', user.id)
+      .single(),
+  ]);
+
+  const metrics  = metricsResult.status  === 'fulfilled' ? metricsResult.value.data  || [] : [];
+  const goals    = goalsResult.status    === 'fulfilled' ? goalsResult.value.data    || [] : [];
+  const pipeline = pipelineResult.status === 'fulfilled' ? pipelineResult.value.data || [] : [];
+  const perf     = perfResult.status     === 'fulfilled' ? perfResult.value.data     : null;
+
+  // Aggregate stats
+  const sentCount     = metrics.reduce((s, d) => s + (d.messages_sent     || 0), 0);
+  const positiveCount = metrics.reduce((s, d) => s + (d.positive_outcomes || 0), 0);
+  const shownCount    = metrics.reduce((s, d) => s + (d.opportunities_shown || 0), 0);
+  const replyRatePct  = sentCount > 0 ? Math.round((positiveCount / sentCount) * 100) : 0;
+
+  // Compute streak: count consecutive days (going backwards from today) that had at least 1 message sent
+  const metricsByDate = {};
+  metrics.forEach(d => { metricsByDate[d.date] = d; });
+  let streakDays = 0;
+  for (let i = 0; i < 30; i++) {
+    const d = new Date(Date.now() - i * 86400000).toISOString().split('T')[0];
+    if (metricsByDate[d]?.messages_sent > 0) {
+      streakDays++;
+    } else if (i > 0) {
+      // Allow today to be 0 (day not finished yet) only if yesterday had activity
+      break;
+    }
+  }
+
+  const pipelineValue = pipeline.reduce((s, o) => s + (o.deal_value || 0), 0);
+  const stageCounts   = pipeline.reduce((acc, o) => {
+    acc[o.stage] = (acc[o.stage] || 0) + 1;
+    return acc;
+  }, {});
+
+  const isQuietWeek = sentCount === 0 && shownCount === 0;
+
+  // Generate Groq commentary — Groq only (no Perplexity for digest per requirements)
+  let commentary = '';
+  try {
+    const goalSummaries = goals.map(g =>
+      `${g.goal_text}: ${g.current_value || 0}/${g.target_value || '?'} ${g.target_unit || ''}`
+    ).join(', ') || 'none set';
+
+    const prompt = isQuietWeek
+      ? `Write 2-3 sentences of warm, motivating coaching for a founder who had a quiet week (sent 0 messages, found 0 leads). Encourage them to start small next week. Product: ${user.product_description || 'not specified'}. Sound like a real coach, not a newsletter.`
+      : `You are an AI sales coach writing a brief weekly summary for a founder.
+Write 2-3 sentences of coaching commentary based on their week's performance.
+Be specific to their numbers. Be encouraging but honest. Mention one concrete thing they should focus on next week.
+Sound like a real coach, not a newsletter. Never use words like "leverage", "synergy", or "unlock".
+
+User profile: ${user.product_description || 'not specified'} | archetype: ${user.archetype || 'seller'}
+This week: ${sentCount} messages sent, ${positiveCount} positive replies, reply rate: ${replyRatePct}%, pipeline value: $${pipelineValue}
+Goals: ${goalSummaries}
+
+Respond with ONLY the commentary text, 2-3 sentences.`;
+
+    const { content, tokens_in, tokens_out } = await callWithFallback({
+      systemPrompt: 'You write concise, personalised coaching commentary. No markdown, no formatting.',
+      messages:     [{ role: 'user', content: prompt }],
+      temperature:  0.7,
+      maxTokens:    200,
+    });
+    await recordTokenUsage(user.id, 'groq', tokens_in, tokens_out);
+    commentary = content.trim();
+  } catch (err) {
+    console.warn(`[EmailDigest] Groq failed for ${user.id}, using generic comment`);
+    commentary = isQuietWeek
+      ? 'Every week is a fresh start. Even one outreach message puts you ahead of doing nothing. You have everything you need to make next week count.'
+      : `You sent ${sentCount} messages this week. Keep logging your outcomes so Clutch can learn what works best for you.`;
+  }
+
+  // Build HTML email
+  const html   = buildEmailHtml({ user, sentCount, positiveCount, replyRatePct, streakDays, pipelineValue, stageCounts, goals, commentary, isQuietWeek });
+  const subject = isQuietWeek
+    ? `Let's make next week count 🚀`
+    : `Your week: ${sentCount} messages, ${positiveCount} replies 📈`;
+
+  // Send: Gmail first → Resend fallback
+  await sendEmail({ to: toEmail, subject, html });
+
+  // Update last_digest_sent_at
+  await supabaseAdmin
+    .from('users')
+    .update({ last_digest_sent_at: new Date().toISOString() })
+    .eq('id', user.id);
+};
+
+// ──────────────────────────────────────────
+// EMAIL DELIVERY — Gmail → Resend fallback
+// ──────────────────────────────────────────
+const sendEmail = async ({ to, subject, html }) => {
+  const gmail = getGmailTransport();
+
+  if (gmail) {
+    try {
+      await gmail.sendMail({ from: EMAIL_DIGEST_FROM, to, subject, html });
+      return; // Success — done
+    } catch (err) {
+      // Distinguish transient (5xx, timeout) from permanent (4xx auth) errors
+      const isPermanent = err.responseCode >= 400 && err.responseCode < 500;
+      if (isPermanent) {
+        console.error(`[EmailDigest] Gmail permanent error (${err.responseCode}), will NOT fallback:`, err.message);
+        throw err;
+      }
+      console.warn(`[EmailDigest] Gmail transient failure, falling back to Resend:`, err.message);
+    }
+  }
+
+  // Fallback: Resend
+  const resend = getResendClient();
+  if (!resend) throw new Error('No email provider configured (GMAIL_APP_PASSWORD and RESEND_API_KEY both missing)');
+
+  const { error } = await resend.emails.send({ from: EMAIL_DIGEST_FROM, to, subject, html });
+  if (error) throw new Error(`Resend error: ${error.message}`);
+};
+
+// ──────────────────────────────────────────
+// HTML EMAIL BUILDER — table-based layout for email client compatibility
+// ──────────────────────────────────────────
+const buildEmailHtml = ({ user, sentCount, positiveCount, replyRatePct, streakDays, pipelineValue, stageCounts, goals, commentary, isQuietWeek }) => {
+  const firstName  = user.name?.split(' ')[0] || 'there';
+  const settingsUrl = `${FRONTEND_URL}/settings?tab=notifications`;
+  const ctaUrl      = FRONTEND_URL;
+
+  const goalRows = goals.length
+    ? goals.map(g => {
+        const pct = g.target_value ? Math.min(100, Math.round(((g.current_value || 0) / g.target_value) * 100)) : null;
+        const barWidth = pct !== null ? pct : 0;
+        return `
+          <tr><td style="padding:8px 0;">
+            <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;">${g.goal_text}</p>
+            ${pct !== null ? `
+              <table width="100%" cellpadding="0" cellspacing="0"><tr>
+                <td style="background:#1e293b;border-radius:4px;height:6px;" width="100%">
+                  <table cellpadding="0" cellspacing="0"><tr>
+                    <td style="background:#6366f1;border-radius:4px;height:6px;width:${barWidth}%;">&nbsp;</td>
+                  </tr></table>
+                </td>
+                <td width="40" style="padding-left:8px;font-size:12px;color:#94a3b8;">${pct}%</td>
+              </tr></table>
+            ` : '<p style="font-size:12px;color:#64748b;margin:2px 0 0;">No target set</p>'}
+          </td></tr>`;
+      }).join('')
+    : `<tr><td style="padding:8px 0;font-size:13px;color:#64748b;">No active goals this week.</td></tr>`;
+
+  const stageItems = Object.entries(stageCounts)
+    .map(([stage, count]) => `${count} ${stage.replace('_', '/')}`)
+    .join(' · ') || 'No active pipeline';
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;">
+    <tr><td align="center" style="padding:40px 16px;">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;background:#1e293b;border-radius:16px;overflow:hidden;">
+
+        <!-- Header -->
+        <tr><td style="background:#6366f1;padding:32px 40px;">
+          <p style="margin:0;font-size:13px;color:#c7d2fe;text-transform:uppercase;letter-spacing:1px;">Clutch AI</p>
+          <h1 style="margin:8px 0 0;font-size:28px;color:#fff;font-weight:700;">Your week in review</h1>
+          <p style="margin:8px 0 0;color:#c7d2fe;font-size:15px;">Hey ${firstName} — here's how your week looked.</p>
+        </td></tr>
+
+        <!-- Stats row: Sent / Replies / Reply Rate / Streak -->
+        <tr><td style="padding:32px 40px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td width="25%" align="center" style="padding:0 8px 0 0;">
+                <div style="background:#0f172a;border-radius:12px;padding:16px;">
+                  <p style="margin:0;font-size:24px;font-weight:700;color:#6366f1;">${sentCount}</p>
+                  <p style="margin:4px 0 0;font-size:11px;color:#94a3b8;text-transform:uppercase;">Sent</p>
+                </div>
+              </td>
+              <td width="25%" align="center" style="padding:0 8px;">
+                <div style="background:#0f172a;border-radius:12px;padding:16px;">
+                  <p style="margin:0;font-size:24px;font-weight:700;color:#10b981;">${positiveCount}</p>
+                  <p style="margin:4px 0 0;font-size:11px;color:#94a3b8;text-transform:uppercase;">Replies</p>
+                </div>
+              </td>
+              <td width="25%" align="center" style="padding:0 8px;">
+                <div style="background:#0f172a;border-radius:12px;padding:16px;">
+                  <p style="margin:0;font-size:24px;font-weight:700;color:#f59e0b;">${replyRatePct}%</p>
+                  <p style="margin:4px 0 0;font-size:11px;color:#94a3b8;text-transform:uppercase;">Reply Rate</p>
+                </div>
+              </td>
+              <td width="25%" align="center" style="padding:0 0 0 8px;">
+                <div style="background:#0f172a;border-radius:12px;padding:16px;">
+                  <p style="margin:0;font-size:24px;font-weight:700;color:#e2e8f0;">${streakDays}🔥</p>
+                  <p style="margin:4px 0 0;font-size:11px;color:#94a3b8;text-transform:uppercase;">Day Streak</p>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+
+        <!-- Pipeline summary -->
+        <tr><td style="padding:24px 40px 0;">
+          <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;color:#94a3b8;letter-spacing:1px;">Pipeline</p>
+          <p style="margin:0;font-size:14px;color:#cbd5e1;">${stageItems}</p>
+        </td></tr>
+
+        <!-- Goals -->
+        <tr><td style="padding:24px 40px 0;">
+          <p style="margin:0 0 8px;font-size:12px;text-transform:uppercase;color:#94a3b8;letter-spacing:1px;">Active Goals</p>
+          <table width="100%" cellpadding="0" cellspacing="0">${goalRows}</table>
+        </td></tr>
+
+        <!-- AI Commentary -->
+        <tr><td style="padding:24px 40px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#312e81;border-radius:12px;border-left:3px solid #6366f1;">
+            <tr><td style="padding:20px;">
+              <p style="margin:0 0 8px;font-size:11px;text-transform:uppercase;color:#a5b4fc;letter-spacing:1px;">🧠 Your Coach Says</p>
+              <p style="margin:0;font-size:15px;color:#e2e8f0;line-height:1.6;">${commentary}</p>
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <!-- CTA -->
+        <tr><td style="padding:32px 40px;" align="center">
+          <a href="${ctaUrl}" style="display:inline-block;background:#6366f1;color:#fff;font-size:14px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:10px;">Open Clutch →</a>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="padding:0 40px 32px;" align="center">
+          <p style="margin:0;font-size:12px;color:#475569;">
+            You're receiving this because weekly digests are enabled. 
+            <a href="${settingsUrl}" style="color:#6366f1;text-decoration:none;">Unsubscribe</a>
+          </p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+};

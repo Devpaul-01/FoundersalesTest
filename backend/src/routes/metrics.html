@@ -1,0 +1,111 @@
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import { getUsageSummary } from '../services/tokenTracker.js';
+import supabaseAdmin from '../config/supabase.js';
+
+const router = Router();
+
+// GET /api/metrics/dashboard - Full dashboard
+router.get('/dashboard', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+  const today = new Date().toISOString().split('T')[0];
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+
+  // Parallel fetches for speed
+  const [
+    { data: dailyData },
+    { data: profile },
+    { data: todayOpps },
+    { data: pipelineMetrics },
+    tokenUsage
+  ] = await Promise.all([
+    supabaseAdmin.from('daily_metrics').select('*').eq('user_id', userId)
+      .gte('date', thirtyDaysAgo).order('date', { ascending: true }),
+
+    supabaseAdmin.from('user_performance_profiles').select('*').eq('user_id', userId).single(),
+
+    supabaseAdmin.from('opportunities').select('status, marked_sent_at')
+      .eq('user_id', userId).gte('created_at', `${today}T00:00:00`),
+
+    supabaseAdmin.from('pipeline_metrics').select('*').eq('user_id', userId).single(),
+
+    getUsageSummary(userId, req.user.tier || 'free')
+  ]);
+
+  const todayStats = {
+    shown: todayOpps?.length || 0,
+    sent: todayOpps?.filter(o => o.marked_sent_at).length || 0
+  };
+
+  res.json({
+    today: todayStats,
+    overall: {
+      total_sent: profile?.total_sent || 0,
+      total_positive: profile?.total_positive || 0,
+      positive_rate: Math.round((profile?.positive_rate || 0) * 100),
+      learned_patterns: profile?.learned_patterns || null
+    },
+    pipeline: {
+      total_revenue: pipelineMetrics?.total_revenue || 0,
+      pipeline_value: pipelineMetrics?.pipeline_value || 0,
+      win_rate_pct: pipelineMetrics?.win_rate_pct || 0,
+      contacted_count: pipelineMetrics?.contacted_count || 0,
+      replied_count: pipelineMetrics?.replied_count || 0,
+      call_demo_count: pipelineMetrics?.call_demo_count || 0,
+      closed_won_count: pipelineMetrics?.closed_won_count || 0,
+      closed_lost_count: pipelineMetrics?.closed_lost_count || 0
+    },
+    streak: calculateStreak(dailyData || []),
+    chart_data: (dailyData || []).map(d => ({
+      date: d.date,
+      sent: d.messages_sent || 0,
+      positive: d.positive_outcomes || 0,
+      positive_rate: d.positive_rate ? Math.round(d.positive_rate * 100) : 0
+    })),
+    token_usage: tokenUsage,
+    insights: generateInsights(profile, todayStats, pipelineMetrics)
+  });
+}));
+
+// GET /api/metrics/usage - Token usage only
+router.get('/usage', asyncHandler(async (req, res) => {
+  const usage = await getUsageSummary(req.user.id, req.user.tier || 'free');
+  res.json(usage);
+}));
+
+// ──────────────────────────────────────────
+
+function calculateStreak(dailyData) {
+  if (!dailyData.length) return 0;
+  const byDate = {};
+  for (const d of dailyData) byDate[d.date] = d;
+  let streak = 0;
+  for (let i = 0; i < 30; i++) {
+    const date = new Date(Date.now() - i * 86400000).toISOString().split('T')[0];
+    if (byDate[date]?.messages_sent > 0) streak++;
+    else if (i > 0) break;
+  }
+  return streak;
+}
+
+function generateInsights(profile, today, pipeline) {
+  const insights = [];
+  if (pipeline?.total_revenue > 0) {
+    insights.push(`💰 $${pipeline.total_revenue.toLocaleString()} closed through Clutch`);
+  }
+  if (pipeline?.pipeline_value > 0) {
+    insights.push(`📈 $${pipeline.pipeline_value.toLocaleString()} in active pipeline`);
+  }
+  if (profile?.positive_rate > 0.3) {
+    insights.push(`Your positive rate (${Math.round(profile.positive_rate * 100)}%) is above average. What you're doing is working.`);
+  }
+  if (today.sent === 0) {
+    insights.push("Send one message today. That's all it takes to keep the momentum.");
+  }
+  if (profile?.learned_patterns) {
+    insights.push(profile.learned_patterns);
+  }
+  return insights;
+}
+
+export default router;

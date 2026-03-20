@@ -1,0 +1,495 @@
+// src/routes/practice.js
+// ============================================================
+// PRACTICE MODE V2 — powered by Groq
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import {
+  PRACTICE_SCENARIOS,
+  QUEUE_JOB_TYPES,
+  GHOST_TIMEOUT_SECONDS
+} from '../config/constants.js';
+import groqService from '../services/groq.js';
+import { preprocessAttachmentsForGrok, buildGrokAttachmentPrompt } from '../utils/attachmentProcessor.js';
+import supabaseAdmin from '../config/supabase.js';
+
+const router = Router();
+
+// ──────────────────────────────────────────
+// POST /api/practice/start
+// Body:
+//   scenario_type         — one of PRACTICE_SCENARIOS types (required)
+//   scenario_text         — user-written scenario description (if provided, skips AI generation)
+//   opportunity_context   — raw context string from an opportunity card (triggers AI generation)
+// ──────────────────────────────────────────
+router.post('/start', asyncHandler(async (req, res) => {
+  const { scenario_type, scenario_text, opportunity_context, triggered_by_feedback_id } = req.body;
+  const userId = req.user.id;
+
+  const selectedType   = scenario_type || selectWeightedScenario();
+  const scenarioConfig = PRACTICE_SCENARIOS.find(s => s.type === selectedType);
+
+  let practicePrompt;
+
+  if (scenario_text?.trim()) {
+    // User wrote their own scenario — use it directly, no AI call needed
+    practicePrompt = scenario_text.trim();
+  } else if (opportunity_context?.trim()) {
+    // Coming from an opportunity card — generate scenario from that specific context
+    practicePrompt = await groqService.generatePracticeScenarioFromOpportunity(
+      req.user, selectedType, opportunity_context
+    );
+  } else {
+    // Fallback: AI generates a generic scenario for this type
+    practicePrompt = await groqService.generatePracticeScenarioPrompt(req.user, selectedType);
+  }
+
+  const { data: chat, error: chatError } = await supabaseAdmin
+    .from('chats')
+    .insert({
+      user_id:   userId,
+      title:     `Practice: ${scenarioConfig?.label || selectedType}`,
+      chat_type: 'practice'
+    })
+    .select()
+    .single();
+
+  if (chatError) throw chatError;
+
+  const { data: session, error: sessionError } = await supabaseAdmin
+    .from('practice_sessions')
+    .insert({
+      user_id:                  userId,
+      scenario_type:            selectedType,
+      practice_prompt:          practicePrompt,
+      triggered_by_feedback_id: triggered_by_feedback_id || null,
+      chat_id:                  chat.id,
+      completed:                false
+    })
+    .select()
+    .single();
+
+  if (sessionError) throw sessionError;
+
+  await supabaseAdmin
+    .from('chats')
+    .update({ practice_session_id: session.id })
+    .eq('id', chat.id);
+
+  await supabaseAdmin.from('chat_messages').insert({
+    chat_id:       chat.id,
+    user_id:       userId,
+    role:          'system',
+    content:       practicePrompt,
+    scenario_type: selectedType
+  });
+
+  res.status(201).json({
+    session_id:       session.id,
+    chat_id:          chat.id,
+    scenario_type:    selectedType,
+    scenario_label:   scenarioConfig?.label,
+    practice_prompt:  practicePrompt,
+    instruction:      getPracticeInstruction(selectedType),
+    realtime_channel: `chat:${chat.id}`
+  });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/practice/sessions
+// ──────────────────────────────────────────
+router.get('/sessions', asyncHandler(async (req, res) => {
+  const { limit = 20, offset = 0 } = req.query;
+
+  const { data: sessions, error } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('id, scenario_type, completed, rating, created_at, chat_id, completed_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+  if (error) throw error;
+
+  const { data: allSessions } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('scenario_type, completed, rating')
+    .eq('user_id', req.user.id);
+
+  const { data: badges } = await supabaseAdmin
+    .from('practice_badges')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('earned_at', { ascending: false });
+
+  const completed     = allSessions?.filter(s => s.completed) || [];
+  const ratedSessions = completed.filter(s => s.rating);
+  const avg_rating    = ratedSessions.length > 0
+    ? ratedSessions.reduce((sum, s) => sum + s.rating, 0) / ratedSessions.length
+    : null;
+
+  res.json({
+    sessions: sessions || [],
+    stats: {
+      total:      allSessions?.length || 0,
+      completed:  completed.length,
+      avg_rating: avg_rating ? parseFloat(avg_rating.toFixed(1)) : null,
+      streak:     calculatePracticeStreak(allSessions || [])
+    },
+    badges: badges || []
+  });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/practice/scenarios
+// ──────────────────────────────────────────
+router.get('/scenarios', asyncHandler(async (req, res) => {
+  const { data: sessions } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('scenario_type, completed')
+    .eq('user_id', req.user.id);
+
+  const counts = {};
+  for (const s of (sessions || [])) {
+    if (!counts[s.scenario_type]) counts[s.scenario_type] = 0;
+    if (s.completed) counts[s.scenario_type]++;
+  }
+
+  res.json({
+    scenarios: PRACTICE_SCENARIOS.map(s => ({
+      ...s,
+      times_practiced: counts[s.type] || 0
+    }))
+  });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/practice/:sessionId/messages
+// ──────────────────────────────────────────
+router.get('/:sessionId/messages', asyncHandler(async (req, res) => {
+  const { sessionId } = req.params;
+  const { limit = 50, before } = req.query;
+
+  const { data: session, error: sessionError } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('id, chat_id, scenario_type, completed, practice_prompt')
+    .eq('id', sessionId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (sessionError || !session) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Session not found' });
+  }
+
+  let query = supabaseAdmin
+    .from('chat_messages')
+    .select('id, role, content, delivery_status, delivered_at, seen_at, replied_at, ghosted_at, created_at, scenario_type, coaching_tip, attachments, model_used')
+    .eq('chat_id', session.chat_id)
+    .order('created_at', { ascending: true })
+    .limit(parseInt(limit));
+
+  if (before) query = query.lt('created_at', before);
+
+  const { data: messages, error: msgError } = await query;
+  if (msgError) throw msgError;
+
+  res.json({
+    session_id:    sessionId,
+    chat_id:       session.chat_id,
+    scenario_type: session.scenario_type,
+    completed:     session.completed,
+    messages:      messages || []
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/practice/:sessionId/message
+// ──────────────────────────────────────────
+router.post('/:sessionId/message', asyncHandler(async (req, res) => {
+  const { sessionId } = req.params;
+  const { content, attachment_ids = [] } = req.body;
+  const userId = req.user.id;
+
+  if (!content?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Message content required' });
+  }
+
+  const { data: session, error: sessionError } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .eq('user_id', userId)
+    .single();
+
+  if (sessionError || !session) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Session not found' });
+  }
+
+  if (session.completed) {
+    return res.status(400).json({ error: 'SESSION_COMPLETE', message: 'This session is already complete' });
+  }
+
+  let attachments = [];
+  if (attachment_ids.length > 0) {
+    const { data: files } = await supabaseAdmin
+      .from('file_uploads')
+      .select('id, public_url, original_filename, file_type, mime_type')
+      .in('id', attachment_ids)
+      .eq('user_id', userId);
+    attachments = files || [];
+  }
+
+  let attachmentContext = '';
+  if (attachments.length > 0) {
+    try {
+      const processed = await preprocessAttachmentsForGrok(attachments);
+      attachmentContext = buildGrokAttachmentPrompt(processed);
+    } catch (err) {
+      console.warn('[Practice] Attachment processing failed:', err.message);
+    }
+  }
+
+  const { data: userMessage, error: msgError } = await supabaseAdmin
+    .from('chat_messages')
+    .insert({
+      chat_id:         session.chat_id,
+      user_id:         userId,
+      role:            'user',
+      content,
+      delivery_status: 'sent',
+      scenario_type:   session.scenario_type,
+      attachments:     attachments.length > 0
+        ? attachments.map(f => ({ id: f.id, url: f.public_url, name: f.original_filename, type: f.file_type }))
+        : []
+    })
+    .select()
+    .single();
+
+  if (msgError) throw msgError;
+
+  const scenarioConfig  = PRACTICE_SCENARIOS.find(s => s.type === session.scenario_type);
+  const now             = new Date();
+
+  // ── INTERESTED: instant inline reply (no queue delay) ──────────────────────
+  // For the "interested" scenario we reply immediately so the conversation feels
+  // like a real, engaged prospect — queue delays would break the immersion.
+  if (session.scenario_type === 'interested') {
+    // Mark delivered + seen immediately
+    await supabaseAdmin
+      .from('chat_messages')
+      .update({ delivery_status: 'delivered', delivered_at: now.toISOString() })
+      .eq('id', userMessage.id);
+
+    const { data: history } = await supabaseAdmin
+      .from('chat_messages')
+      .select('role, content')
+      .eq('chat_id', session.chat_id)
+      .not('role', 'eq', 'system')
+      .order('created_at', { ascending: true });
+
+    const fullContent = attachmentContext ? `${content}${attachmentContext}` : content;
+
+    const [prospectReply, coachingTip] = await Promise.all([
+      groqService.generatePracticeProspectReply(
+        req.user, fullContent, 'interested', (history || []).slice(-6)
+      ),
+      groqService.generateCoachingTip(req.user, fullContent, 'interested', null),
+    ]);
+
+    // Insert AI reply
+    const { data: aiMsg } = await supabaseAdmin.from('chat_messages').insert({
+      chat_id:         session.chat_id,
+      user_id:         userId,
+      role:            'assistant',
+      content:         prospectReply || "Interesting! Tell me more.",
+      delivery_status: 'replied',
+      replied_at:      now.toISOString(),
+      scenario_type:   'interested',
+      coaching_tip:    coachingTip,
+      model_used:      'groq',
+    }).select().single();
+
+    // Mark user message as replied
+    await supabaseAdmin
+      .from('chat_messages')
+      .update({ delivery_status: 'replied', replied_at: now.toISOString() })
+      .eq('id', userMessage.id);
+
+    return res.json({
+      success:          true,
+      message_id:       userMessage.id,
+      delivery_status:  'replied',
+      instant_reply:    { id: aiMsg?.id, content: prospectReply, coaching_tip: coachingTip },
+      expect_reply:     true,
+      realtime_channel: `chat:${session.chat_id}`,
+    });
+  }
+
+  // ── ALL OTHER TYPES: schedule through message queue ──────────────────────
+  const jobsToSchedule  = [];
+
+  const deliveredAt = new Date(now.getTime() + randomBetween(5, 15) * 1000);
+  jobsToSchedule.push({
+    job_type:      QUEUE_JOB_TYPES.PRACTICE_DELIVERED,
+    scheduled_for: deliveredAt.toISOString(),
+    payload: {
+      message_id: userMessage.id,
+      chat_id:    session.chat_id,
+      user_id:    userId,
+      session_id: sessionId
+    }
+  });
+
+  if (session.scenario_type !== 'ghost') {
+    const seenAt = new Date(deliveredAt.getTime() + randomBetween(15, 60) * 1000);
+    jobsToSchedule.push({
+      job_type:      QUEUE_JOB_TYPES.PRACTICE_SEEN,
+      scheduled_for: seenAt.toISOString(),
+      payload: { message_id: userMessage.id, chat_id: session.chat_id, user_id: userId }
+    });
+
+    if (scenarioConfig?.reply_delay_range) {
+      const [minDelay, maxDelay] = scenarioConfig.reply_delay_range;
+      const replyAt = new Date(seenAt.getTime() + randomBetween(minDelay, maxDelay) * 1000);
+      jobsToSchedule.push({
+        job_type:      QUEUE_JOB_TYPES.PRACTICE_REPLY,
+        scheduled_for: replyAt.toISOString(),
+        payload: {
+          session_id:           sessionId,
+          chat_id:              session.chat_id,
+          user_message_id:      userMessage.id,
+          user_id:              userId,
+          scenario_type:        session.scenario_type,
+          user_message_content: content,
+          attachment_context:   attachmentContext
+        }
+      });
+    }
+  } else {
+    const ghostAt = new Date(now.getTime() + GHOST_TIMEOUT_SECONDS * 1000);
+    jobsToSchedule.push({
+      job_type:      QUEUE_JOB_TYPES.PRACTICE_GHOST,
+      scheduled_for: ghostAt.toISOString(),
+      payload: {
+        session_id: sessionId,
+        chat_id:    session.chat_id,
+        message_id: userMessage.id,
+        user_id:    userId
+      }
+    });
+  }
+
+  await supabaseAdmin.from('message_queue').insert(jobsToSchedule);
+
+  res.json({
+    success:                 true,
+    message_id:              userMessage.id,
+    delivery_status:         'sent',
+    expect_reply:            session.scenario_type !== 'ghost',
+    estimated_reply_seconds: scenarioConfig?.reply_delay_range
+      ? Math.round(randomBetween(...scenarioConfig.reply_delay_range) + 80)
+      : null,
+    realtime_channel: `chat:${session.chat_id}`
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/practice/:sessionId/complete
+// ──────────────────────────────────────────
+router.post('/:sessionId/complete', asyncHandler(async (req, res) => {
+  const { sessionId } = req.params;
+
+  const { data: session } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!session) return res.status(404).json({ error: 'NOT_FOUND', message: 'Session not found' });
+  if (session.completed) return res.json({ success: true, already_complete: true });
+
+  await supabaseAdmin
+    .from('practice_sessions')
+    .update({ completed: true, completed_at: new Date().toISOString() })
+    .eq('id', sessionId);
+
+  const { count } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', req.user.id)
+    .eq('completed', true);
+
+  if (count === 1) {
+    await supabaseAdmin.from('practice_badges').insert({
+      user_id:           req.user.id,
+      badge_type:        'first_session',
+      badge_label:       '🎯 First Steps',
+      badge_description: 'Completed your first practice session'
+    }).catch(() => {});
+  }
+
+  res.json({ success: true, session_id: sessionId });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/practice/:sessionId/rate
+// ──────────────────────────────────────────
+router.post('/:sessionId/rate', asyncHandler(async (req, res) => {
+  const { sessionId } = req.params;
+  const { rating, rating_note } = req.body;
+
+  if (!rating || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Rating must be between 1 and 5' });
+  }
+
+  const { error } = await supabaseAdmin
+    .from('practice_sessions')
+    .update({ rating: parseInt(rating), rating_note: rating_note?.trim() || null })
+    .eq('id', sessionId)
+    .eq('user_id', req.user.id);
+
+  if (error) throw error;
+  res.json({ success: true, message: 'Rating saved. This helps improve practice quality.' });
+}));
+
+// ──────────────────────────────────────────
+// HELPERS
+// ──────────────────────────────────────────
+
+const randomBetween = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+const selectWeightedScenario = () => {
+  const total = PRACTICE_SCENARIOS.reduce((s, p) => s + p.weight, 0);
+  let random  = Math.random() * total;
+  for (const scenario of PRACTICE_SCENARIOS) {
+    random -= scenario.weight;
+    if (random <= 0) return scenario.type;
+  }
+  return PRACTICE_SCENARIOS[0].type;
+};
+
+const getPracticeInstruction = (scenarioType) => {
+  const map = {
+    interested:      "This person might be open. Write a genuine, low-pressure opener. See what happens.",
+    polite_decline:  "This one's a long shot. Send your best anyway — practice matters even when the odds are low.",
+    ghost:           "Write like you expect a response. Most real messages get ignored — this builds resilience.",
+    skeptical:       "This person will push back. Be confident. Don't over-explain.",
+    price_objection: "Lead with value, not features. Price objections are interest in disguise.",
+    not_right_time:  "Timing matters. Show you understand their situation — don't push."
+  };
+  return map[scenarioType] || 'Write your best outreach message.';
+};
+
+const calculatePracticeStreak = (sessions) => {
+  if (!sessions?.length) return 0;
+  let streak = 0;
+  for (let i = 0; i < 30; i++) {
+    const date = new Date(Date.now() - i * 86400000).toISOString().split('T')[0];
+    if (sessions.some(s => s.created_at?.startsWith(date))) streak++;
+    else if (i > 0) break;
+  }
+  return streak;
+};
+
+export default router;

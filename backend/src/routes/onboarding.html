@@ -1,0 +1,258 @@
+// src/routes/onboarding.js
+// ============================================================
+// ONBOARDING ROUTES — Hybrid-Progressive AI Questions
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import groqService from '../services/groq.js';
+import supabaseAdmin from '../config/supabase.js';
+import { detectAndSaveArchetype } from '../jobs/growthIntelligenceScheduler.js';
+
+
+const router = Router();
+
+// ─────────────────────────────────────────
+// POST /onboarding/basic
+// Step 1: Save basic info, get Burst 1 questions (Foundation)
+// ─────────────────────────────────────────
+router.post('/basic', asyncHandler(async (req, res) => {
+  const {
+    name, role, experience_level, industry, bio,
+    business_name, website, product_description,
+    target_audience, industry_deep_dive, country, state
+  } = req.body;
+
+  if (!product_description || !target_audience) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: 'Product description and target audience are required'
+    });
+  }
+
+  const userId = req.user.id;
+
+  const { error: updateError } = await supabaseAdmin
+    .from('users')
+    .update({
+      name:                name?.trim()                || null,
+      business_name:       business_name?.trim()       || null,
+      product_description: product_description?.trim(),
+      target_audience:     target_audience?.trim(),
+      bio:                 bio?.trim()                 || null,
+      website:             website?.trim()             || null,
+      role:                role                        || null,
+      industry:            industry                    || null,
+      experience_level:    experience_level            || null,
+      industry_deep_dive:  industry_deep_dive?.trim()  || null,
+      country:             country                     || null,
+      state:               state                       || null,
+      onboarding_step:     1,
+    })
+    .eq('id', userId);
+
+  if (updateError) throw updateError;
+
+  // Generate Burst 1: The Foundation (Product & Proof)
+  const result = await groqService.generateBurst1Questions({
+    business_name,
+    product_description,
+    target_audience,
+    bio,
+    industry,
+    industry_deep_dive,
+    role,
+  });
+
+  res.json({
+    success:   true,
+    burst1:    result.questions,
+    ai_source: result.source,
+    next_step: 2,
+    message:   'Basic info saved. Your first questions are ready.'
+  });
+}));
+
+// ─────────────────────────────────────────
+// POST /onboarding/questions/next
+// Dynamically generate the next burst of questions
+// using previous answers as context
+// ─────────────────────────────────────────
+router.post('/questions/next', asyncHandler(async (req, res) => {
+  const { burst_number, previous_answers, basic_info } = req.body;
+
+  if (!burst_number || burst_number < 2 || burst_number > 3) {
+    return res.status(400).json({
+      error:   'VALIDATION_ERROR',
+      message: 'burst_number must be 2 or 3'
+    });
+  }
+
+  if (!previous_answers || typeof previous_answers !== 'object') {
+    return res.status(400).json({
+      error:   'VALIDATION_ERROR',
+      message: 'previous_answers must be an object'
+    });
+  }
+
+  const result = await groqService.generateNextBurst({
+    burst_number,
+    previous_answers,
+    basic_info,
+  });
+
+  res.json({
+    success:          true,
+    questions:        result.questions,
+    interlude_message: result.interlude_message,
+    ai_source:        result.source,
+  });
+}));
+
+// ─────────────────────────────────────────
+// POST /onboarding/answers
+// Final step: Save all answers, build voice profile
+// ─────────────────────────────────────────
+router.post('/answers', asyncHandler(async (req, res) => {
+  const { answers } = req.body;
+
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+    return res.status(400).json({
+      error:   'VALIDATION_ERROR',
+      message: 'Answers must be an object with question-answer pairs'
+    });
+  }
+
+  const answerCount = Object.keys(answers).length;
+  if (answerCount === 0) {
+    return res.status(400).json({
+      error:   'VALIDATION_ERROR',
+      message: 'At least one answer is required'
+    });
+  }
+
+  const userId = req.user.id;
+
+  const { data: existingUser } = await supabaseAdmin
+    .from('users')
+    .select('onboarding_answers, product_description, target_audience, business_name, name, website, bio, industry, role')
+    .eq('id', userId)
+    .single();
+
+  const mergedAnswers = {
+    ...(existingUser?.onboarding_answers || {}),
+    ...answers
+  };
+
+  const { error: saveError } = await supabaseAdmin
+    .from('users')
+    .update({ onboarding_answers: mergedAnswers, onboarding_step: 2 })
+    .eq('id', userId);
+
+  if (saveError) throw saveError;
+
+  const basicInfo = {
+    business_name:       existingUser?.business_name,
+    product_description: existingUser?.product_description,
+    target_audience:     existingUser?.target_audience,
+    website:             existingUser?.website,
+    bio:                 existingUser?.bio,
+    industry:            existingUser?.industry,
+    role:                existingUser?.role,
+  };
+
+  const voiceProfile = await groqService.buildVoiceProfile(basicInfo, mergedAnswers);
+
+  const { error: profileError } = await supabaseAdmin
+    .from('users')
+    .update({
+      voice_profile:        voiceProfile,
+      onboarding_completed: true,
+      onboarding_step:      3
+    })
+    .eq('id', userId);
+
+  if (profileError) throw profileError;
+  detectAndSaveArchetype(userId, {
+    ...basicInfo,
+    onboarding_answers: mergedAnswers
+  }).catch(err => console.error('[Onboarding] Archetype detection failed:', err.message));
+
+
+  res.json({
+    success:       true,
+    voice_profile: voiceProfile,
+    answers_saved: Object.keys(mergedAnswers).length,
+    message:       'Clutch has learned your voice. Your opportunity feed is being set up.',
+    next_step:     'complete'
+  });
+}));
+
+// ─────────────────────────────────────────
+// GET /onboarding/status
+// ─────────────────────────────────────────
+router.get('/status', asyncHandler(async (req, res) => {
+  const { data: user } = await supabaseAdmin
+    .from('users')
+    .select('onboarding_completed, onboarding_step, name, voice_profile, business_name')
+    .eq('id', req.user.id)
+    .single();
+
+  res.json({
+    completed:         user?.onboarding_completed || false,
+    step:              user?.onboarding_step      || 0,
+    has_voice_profile: !!user?.voice_profile,
+    name:              user?.name,
+    business_name:     user?.business_name
+  });
+}));
+
+// ─────────────────────────────────────────
+// PUT /onboarding/profile
+// ─────────────────────────────────────────
+router.put('/profile', asyncHandler(async (req, res) => {
+  const { voice_profile } = req.body;
+
+  if (!voice_profile || typeof voice_profile !== 'object') {
+    return res.status(400).json({
+      error:   'VALIDATION_ERROR',
+      message: 'Invalid voice profile format'
+    });
+  }
+
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({ voice_profile })
+    .eq('id', req.user.id);
+
+  if (error) throw error;
+
+  res.json({
+    success: true,
+    message: 'Profile updated. Clutch will use your new profile for future messages.'
+  });
+}));
+
+// ─────────────────────────────────────────
+// POST /onboarding/rebuild-voice-profile
+// ─────────────────────────────────────────
+router.post('/rebuild-voice-profile', asyncHandler(async (req, res) => {
+  const { data: user } = await supabaseAdmin
+    .from('users')
+    .select('business_name, product_description, target_audience, website, bio, industry, role, onboarding_answers')
+    .eq('id', req.user.id)
+    .single();
+
+  if (!user?.onboarding_answers || !user?.product_description) {
+    return res.status(400).json({
+      error:   'ONBOARDING_REQUIRED',
+      message: 'Complete onboarding first'
+    });
+  }
+
+  const voiceProfile = await groqService.buildVoiceProfile(user, user.onboarding_answers);
+  await supabaseAdmin.from('users').update({ voice_profile: voiceProfile }).eq('id', req.user.id);
+  res.json({ success: true, voice_profile: voiceProfile });
+}));
+
+export default router;

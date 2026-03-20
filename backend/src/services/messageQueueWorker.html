@@ -1,0 +1,318 @@
+// src/jobs/messageQueueWorker.js
+// ============================================================
+// MESSAGE QUEUE WORKER
+// Polls message_queue table every 30 seconds.
+// Executes scheduled jobs for practice mode simulation.
+//
+// FIX: handleReply now uses attachment_context from the job payload
+// so practice AI replies can reference files the user attached.
+// ============================================================
+
+import supabaseAdmin from '../config/supabase.js';
+import { QUEUE_JOB_TYPES, DELIVERY_STATUS } from '../config/constants.js';
+import grokService from '../services/grok.js';
+import { notifyUser, Notifications } from '../services/notifications.js';
+
+export const runMessageQueueWorker = async () => {
+  const now = new Date().toISOString();
+
+  const { data: jobs, error } = await supabaseAdmin
+    .from('message_queue')
+    .select('*')
+    .eq('status', 'pending')
+    .lte('scheduled_for', now)
+    .lt('attempts', 3)
+    .order('scheduled_for', { ascending: true })
+    .limit(50);
+
+  if (error) {
+    console.error('[QueueWorker] Failed to fetch jobs:', error.message);
+    return;
+  }
+
+  if (!jobs?.length) return;
+
+  console.log(`[QueueWorker] Processing ${jobs.length} jobs`);
+
+  for (const job of jobs) {
+    // Optimistic lock: claim the job atomically
+    const { count } = await supabaseAdmin
+      .from('message_queue')
+      .update({ status: 'executing', attempts: job.attempts + 1 })
+      .eq('id', job.id)
+      .eq('status', 'pending')
+      .select('id', { count: 'exact' });
+
+    if (!count) continue; // Another worker claimed it
+
+    try {
+      await executeJob(job);
+
+      await supabaseAdmin
+        .from('message_queue')
+        .update({ status: 'done', executed_at: new Date().toISOString() })
+        .eq('id', job.id);
+
+    } catch (err) {
+      console.error(`[QueueWorker] Job ${job.id} (${job.job_type}) failed:`, err.message);
+
+      const isFinalFailure = job.attempts + 1 >= job.max_attempts;
+
+      await supabaseAdmin
+        .from('message_queue')
+        .update({
+          status: isFinalFailure ? 'failed' : 'pending',
+          last_error: err.message,
+          scheduled_for: isFinalFailure
+            ? job.scheduled_for
+            : new Date(Date.now() + 60000).toISOString()
+        })
+        .eq('id', job.id);
+    }
+  }
+};
+
+const executeJob = async (job) => {
+  switch (job.job_type) {
+    case QUEUE_JOB_TYPES.PRACTICE_DELIVERED: return handleDelivered(job.payload);
+    case QUEUE_JOB_TYPES.PRACTICE_SEEN:      return handleSeen(job.payload);
+    case QUEUE_JOB_TYPES.PRACTICE_REPLY:     return handleReply(job.payload);
+    case QUEUE_JOB_TYPES.PRACTICE_GHOST:     return handleGhost(job.payload);
+    default: throw new Error(`Unknown job type: ${job.job_type}`);
+  }
+};
+
+// ──────────────────────────────────────────
+// JOB HANDLERS
+// ──────────────────────────────────────────
+
+const handleDelivered = async ({ message_id }) => {
+  await supabaseAdmin
+    .from('chat_messages')
+    .update({
+      delivery_status: DELIVERY_STATUS.DELIVERED,
+      delivered_at: new Date().toISOString()
+    })
+    .eq('id', message_id);
+};
+
+const handleSeen = async ({ message_id }) => {
+  await supabaseAdmin
+    .from('chat_messages')
+    .update({
+      delivery_status: DELIVERY_STATUS.SEEN,
+      seen_at: new Date().toISOString()
+    })
+    .eq('id', message_id);
+};
+
+/**
+ * Generate and post the AI prospect reply.
+ * Now accepts attachment_context from the job payload so the AI
+ * can reference files the user attached to their practice message.
+ */
+const handleReply = async ({
+  session_id,
+  chat_id,
+  user_message_id,
+  user_id,
+  scenario_type,
+  user_message_content,
+  attachment_context = ''  // NEW: passed from practice.js when attachments present
+}) => {
+  const [{ data: session }, { data: user }] = await Promise.all([
+    supabaseAdmin.from('practice_sessions').select('*').eq('id', session_id).single(),
+    supabaseAdmin.from('users').select('*').eq('id', user_id).single()
+  ]);
+
+  if (!session || !user) throw new Error('Session or user not found');
+  if (session.completed) return;
+
+  // Get conversation history
+  const { data: history } = await supabaseAdmin
+    .from('chat_messages')
+    .select('role, content')
+    .eq('chat_id', chat_id)
+    .not('role', 'eq', 'system')
+    .order('created_at', { ascending: true });
+
+  // Combine message content with any attachment context
+  const fullMessageContent = attachment_context
+    ? `${user_message_content}${attachment_context}`
+    : user_message_content;
+
+  const prospectReply = await grokService.generatePracticeProspectReply(
+    user,
+    fullMessageContent,
+    scenario_type,
+    (history || []).slice(-6)
+  );
+
+  const isGhost = prospectReply === null;
+
+  const coachingTip = await grokService.generateCoachingTip(
+    user, user_message_content, scenario_type, prospectReply
+  );
+
+  if (!isGhost) {
+    await supabaseAdmin.from('chat_messages').insert({
+      chat_id,
+      user_id,
+      role: 'assistant',
+      content: prospectReply,
+      delivery_status: DELIVERY_STATUS.REPLIED,
+      replied_at: new Date().toISOString(),
+      scenario_type,
+      coaching_tip: coachingTip,
+      model_used: 'grok'
+    });
+
+    await supabaseAdmin
+      .from('chat_messages')
+      .update({ delivery_status: DELIVERY_STATUS.REPLIED, replied_at: new Date().toISOString() })
+      .eq('id', user_message_id);
+  }
+
+  await supabaseAdmin
+    .from('practice_sessions')
+    .update({
+      user_message: user_message_content,
+      ai_response: prospectReply || '[No response]',
+      result: isGhost ? 'ghost' : (scenario_type === 'interested' ? 'positive' : 'negative'),
+      coaching_tip: coachingTip,
+      completed: true,
+      completed_at: new Date().toISOString()
+    })
+    .eq('id', session_id);
+
+  await checkAndAwardBadges(user_id, scenario_type, isGhost);
+
+  if (!isGhost) {
+    await notifyUser(user_id, {
+      title: 'Practice reply received 💬',
+      body: "The prospect responded to your message. Tap to see how it went.",
+      data: { type: 'practice_reply', chat_id, session_id }
+    });
+  }
+};
+
+const handleGhost = async ({ session_id, chat_id, message_id, user_id }) => {
+  const { data: session } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('completed, user_message')
+    .eq('id', session_id)
+    .single();
+
+  if (!session || session.completed) return;
+
+  await supabaseAdmin
+    .from('chat_messages')
+    .update({
+      delivery_status: DELIVERY_STATUS.GHOSTED,
+      ghosted_at: new Date().toISOString()
+    })
+    .eq('id', message_id);
+
+  const { data: user } = await supabaseAdmin
+    .from('users').select('*').eq('id', user_id).single();
+
+  const coachingTip = await grokService.generateCoachingTip(
+    user, session.user_message || '', 'ghost', null
+  ).catch(() => "Getting ghosted is normal. The best founders send more, not better.");
+
+  await supabaseAdmin.from('chat_messages').insert({
+    chat_id,
+    user_id,
+    role: 'system',
+    content: `👻 Ghosted — no response.\n\n💡 ${coachingTip}`,
+    coaching_tip: coachingTip
+  });
+
+  await supabaseAdmin
+    .from('practice_sessions')
+    .update({
+      ai_response: '[No response — ghosted]',
+      result: 'ghost',
+      coaching_tip: coachingTip,
+      completed: true,
+      completed_at: new Date().toISOString()
+    })
+    .eq('id', session_id);
+
+  await checkAndAwardBadges(user_id, 'ghost', true);
+
+  await notifyUser(user_id, {
+    title: 'Ghosted 👻',
+    body: "They didn't reply. Tap to see your coaching tip.",
+    data: { type: 'practice_ghost', chat_id, session_id }
+  });
+};
+
+// ──────────────────────────────────────────
+// BADGE SYSTEM
+// ──────────────────────────────────────────
+
+const checkAndAwardBadges = async (userId, scenarioType, isGhost) => {
+  const { count: totalCompleted } = await supabaseAdmin
+    .from('practice_sessions')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('completed', true);
+
+  const { data: earned } = await supabaseAdmin
+    .from('practice_badges')
+    .select('badge_type')
+    .eq('user_id', userId);
+
+  const earnedSet = new Set(earned?.map(b => b.badge_type) || []);
+
+  const candidates = [
+    {
+      type: 'first_session',
+      condition: totalCompleted >= 1,
+      label: '🎯 First Steps',
+      desc: 'Completed your first practice session'
+    },
+    {
+      type: 'first_rejection',
+      condition: scenarioType !== 'interested' && !earnedSet.has('first_rejection'),
+      label: '💪 Rejection Survivor',
+      desc: 'Survived your first practice rejection'
+    },
+    {
+      type: 'ghostbuster',
+      condition: isGhost && !earnedSet.has('ghostbuster'),
+      label: '👻 Ghostbuster',
+      desc: 'Practiced getting ghosted'
+    },
+    {
+      type: '5_sessions',
+      condition: totalCompleted >= 5,
+      label: '🔥 Getting Comfortable',
+      desc: '5 practice sessions complete'
+    },
+    {
+      type: '10_sessions',
+      condition: totalCompleted >= 10,
+      label: '⚡ Rejection Proof',
+      desc: "10 sessions — rejection doesn't slow you down"
+    },
+    {
+      type: 'price_handler',
+      condition: scenarioType === 'price_objection' && !earnedSet.has('price_handler'),
+      label: '💰 Money Talks',
+      desc: 'Practiced a price objection'
+    }
+  ];
+
+  for (const badge of candidates) {
+    if (badge.condition && !earnedSet.has(badge.type)) {
+      await supabaseAdmin.from('practice_badges').insert({
+        user_id: userId,
+        badge_type: badge.type,
+        badge_label: badge.label,
+        badge_description: badge.desc
+      }).catch(() => {}); // Unique constraint handles duplicates
+    }
+  }
+};

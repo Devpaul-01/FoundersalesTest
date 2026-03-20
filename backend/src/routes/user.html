@@ -1,0 +1,222 @@
+// src/routes/user.js
+// ============================================================
+// USER ROUTES
+// Extracted from app.js where they were inline.
+// All routes are authenticated via the authenticate middleware
+// applied in app.js: app.use('/api/user', authenticate, userRoutes)
+//
+// PUT  /api/user/fcm-token                 — Save FCM push token
+// PUT  /api/user/debug                     — Toggle debug mode
+// PUT  /api/auth/me                        — Update profile fields
+// PUT  /api/user/notification-preferences  — Update notification prefs
+// DELETE /api/auth/account                 — Delete account (soft + hard)
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import supabaseAdmin from '../config/supabase.js';
+import {
+  DEFAULT_NOTIFICATION_PREFS
+} from '../config/constants.js';
+
+const router = Router();
+
+// ──────────────────────────────────────────
+// PUT /api/user/fcm-token
+// Save Firebase Cloud Messaging push token
+// ──────────────────────────────────────────
+router.put('/fcm-token', asyncHandler(async (req, res) => {
+  const { token } = req.body;
+  if (!token?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'token is required' });
+  }
+
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({ fcm_token: token.trim() })
+    .eq('id', req.user.id);
+
+  if (error) return res.status(500).json({ error: 'DB_ERROR', message: error.message });
+  res.json({ success: true });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/user/debug
+// Toggle debug mode (for mobile development)
+// ──────────────────────────────────────────
+router.put('/debug', asyncHandler(async (req, res) => {
+  const { enabled } = req.body;
+
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({ debug_mode: !!enabled })
+    .eq('id', req.user.id);
+
+  if (error) return res.status(500).json({ error: 'DB_ERROR', message: error.message });
+  res.json({ success: true, debug_mode: !!enabled });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/user/notification-preferences
+// FIX: Now allows all 7 notification preference keys (was only 4)
+// FEATURE 2 + 3: Accepts memory_enabled and email_digest_enabled
+// ──────────────────────────────────────────
+router.put('/notification-preferences', asyncHandler(async (req, res) => {
+  // All notification preference keys from constants.js DEFAULT_NOTIFICATION_PREFS
+  const ALLOWED_PREF_KEYS = Object.keys(DEFAULT_NOTIFICATION_PREFS);
+
+  const prefs = {};
+  for (const key of ALLOWED_PREF_KEYS) {
+    if (req.body[key] !== undefined) prefs[key] = !!req.body[key];
+  }
+
+  if (!Object.keys(prefs).length && req.body.memory_enabled === undefined && req.body.email_digest_enabled === undefined) {
+    return res.status(400).json({
+      error:   'VALIDATION_ERROR',
+      message: `At least one valid preference key required: ${ALLOWED_PREF_KEYS.join(', ')}`
+    });
+  }
+
+  // Merge with existing preferences rather than replacing all
+  const { data: existing } = await supabaseAdmin
+    .from('users')
+    .select('notification_preferences')
+    .eq('id', req.user.id)
+    .single();
+
+  const mergedPrefs = {
+    ...(existing?.notification_preferences || DEFAULT_NOTIFICATION_PREFS),
+    ...prefs
+  };
+
+  // Build the user-level updates object (memory_enabled, email_digest_enabled are top-level columns)
+  const userUpdates = { notification_preferences: mergedPrefs };
+  if (req.body.memory_enabled !== undefined)       userUpdates.memory_enabled       = !!req.body.memory_enabled;
+  if (req.body.email_digest_enabled !== undefined) userUpdates.email_digest_enabled = !!req.body.email_digest_enabled;
+
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update(userUpdates)
+    .eq('id', req.user.id);
+
+  if (error) return res.status(500).json({ error: 'DB_ERROR', message: error.message });
+  res.json({ success: true, notification_preferences: mergedPrefs });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/user/memory  — Feature 2
+// Returns the user's active AI memory facts
+// ──────────────────────────────────────────
+router.get('/memory', asyncHandler(async (req, res) => {
+  const { data: facts } = await supabaseAdmin
+    .from('user_memory')
+    .select('id, fact, reinforcement_count, last_reinforced_at, created_at')
+    .eq('user_id', req.user.id)
+    .eq('is_active', true)
+    .order('reinforcement_count', { ascending: false })
+    .limit(30);
+
+  res.json({ facts: facts || [] });
+}));
+
+// ──────────────────────────────────────────
+// DELETE /api/user/memory/:id  — Feature 2
+// Soft-deletes (deactivates) a single memory fact
+// ──────────────────────────────────────────
+router.delete('/memory/:id', asyncHandler(async (req, res) => {
+  const { data: fact } = await supabaseAdmin
+    .from('user_memory')
+    .select('id')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!fact) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Memory fact not found' });
+  }
+
+  await supabaseAdmin
+    .from('user_memory')
+    .update({ is_active: false })
+    .eq('id', req.params.id);
+
+  res.json({ success: true });
+}));
+
+// ──────────────────────────────────────────
+// PUT /api/auth/me
+// Update editable profile fields
+// Note: mounted under /api/auth, not /api/user
+// ──────────────────────────────────────────
+export const updateProfile = asyncHandler(async (req, res) => {
+  const ALLOWED_FIELDS = [
+    'name', 'business_name', 'product_description', 'target_audience',
+    'website', 'role', 'industry', 'experience_level', 'bio', 'preferred_platforms'
+  ];
+
+  const updates = {};
+  for (const key of ALLOWED_FIELDS) {
+    if (req.body[key] !== undefined) updates[key] = req.body[key];
+  }
+
+  if (!Object.keys(updates).length) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'No valid fields to update' });
+  }
+
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update(updates)
+    .eq('id', req.user.id);
+
+  if (error) return res.status(500).json({ error: 'DB_ERROR', message: error.message });
+  res.json({ success: true });
+});
+
+// ──────────────────────────────────────────
+// DELETE /api/auth/account
+// Account deletion — best and safest approach:
+//
+// We keep the soft-delete in users table (preserves FK integrity
+// for opportunities, feedback, analytics) AND hard-delete the
+// Supabase auth user (revokes all tokens, prevents re-login).
+//
+// ORDER MATTERS: soft-delete first, then hard-delete auth.
+// If auth delete fails, the account is soft-deleted (inaccessible)
+// so no real security risk — user can't log back in either way
+// since the auth middleware rejects is_deleted accounts.
+// ──────────────────────────────────────────
+export const deleteAccount = asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+
+  // Step 1: Soft delete — marks account inactive, clears FCM token
+  const { error: softDeleteError } = await supabaseAdmin
+    .from('users')
+    .update({
+      is_deleted:       true,
+      fcm_token:        null,
+      deleted_at:       new Date().toISOString(),
+      // Scrub PII from the profile while preserving analytics integrity
+      name:             null,
+      email:            `deleted_${userId}@deleted.invalid`,
+      voice_profile:    null,
+    })
+    .eq('id', userId);
+
+  if (softDeleteError) {
+    console.error(`[User] Soft delete failed for userId=${userId}:`, softDeleteError.message);
+    return res.status(500).json({ error: 'DELETE_FAILED', message: 'Account deletion failed. Please try again.' });
+  }
+
+  // Step 2: Hard delete from Supabase auth (revokes all tokens)
+  const { error: authDeleteError } = await supabaseAdmin.auth.admin.deleteUser(userId);
+
+  if (authDeleteError) {
+    // Non-fatal: account is already soft-deleted and auth middleware blocks access.
+    // Log for manual cleanup but return success to user.
+    console.error(`[User] Auth hard-delete failed for userId=${userId} (account is soft-deleted, no security risk):`, authDeleteError.message);
+  }
+
+  res.json({ success: true, message: 'Your account has been deleted.' });
+});
+
+export default router;

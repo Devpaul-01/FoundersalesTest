@@ -1,0 +1,709 @@
+// src/routes/growth.js
+// ============================================================
+// GROWTH INTELLIGENCE API
+// Powers: unified feed, daily tips, check-ins, goals, archetypes
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import supabaseAdmin from '../config/supabase.js';
+import groqService from '../services/groq.js';
+import { notifyUser } from '../services/notifications.js';
+import { callWithFallback } from '../services/multiProvider.js';
+import { recordTokenUsage } from '../services/tokenTracker.js';
+
+const router = Router();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/growth/feed
+// Unified feed: growth_cards + recent opportunities, merged and sorted.
+// Growth cards are primary for non-Seller archetypes.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/feed', asyncHandler(async (req, res) => {
+  const userId    = req.user.id;
+  const archetype = req.user.archetype || 'seller';
+  const limit     = parseInt(req.query.limit) || 20;
+
+  // Fetch active growth cards (not dismissed, not expired)
+  const { data: cards } = await supabaseAdmin
+    .from('growth_cards')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('is_dismissed', false)
+    .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
+    .order('priority', { ascending: false })
+    .order('created_at', { ascending: false })
+    .limit(15);
+
+  // Fetch active opportunities
+  const { data: opps } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, platform, source_url, target_context, prepared_message, composite_score, fit_score, timing_score, intent_score, status, created_at, target_name')
+    .eq('user_id', userId)
+    .in('status', ['pending', 'viewed'])
+    .order('composite_score', { ascending: false })
+    .limit(10);
+
+  // Get active goals for context
+  const { data: goals } = await supabaseAdmin
+    .from('user_goals')
+    .select('id, goal_text, current_value, target_value, target_unit, status')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(3);
+
+  // If no growth cards exist yet, trigger generation
+  if (!cards?.length) {
+    // Queue tip generation in the background (don't await)
+    generateFirstTimeCards(userId, req.user).catch(err =>
+      console.error('[GrowthFeed] First-time card generation failed:', err.message)
+    );
+  }
+
+  // Build unified feed items with type tags
+  const feedItems = [];
+
+  // For seller archetype: interleave cards + opps
+  // For others: cards first, then opps at the bottom
+  const SELLER_ARCHETYPES = ['seller', 'freelancer', 'builder'];
+  const isSellerType = SELLER_ARCHETYPES.includes(archetype);
+
+  if (isSellerType) {
+    // Interleave: 2 opps, 1 card, 2 opps, 1 card...
+    const oppItems  = (opps || []).map(o => ({ ...o, feed_type: 'opportunity' }));
+    const cardItems = (cards || []).map(c => ({ ...c, feed_type: 'growth_card' }));
+    let oi = 0, ci = 0;
+    while (oi < oppItems.length || ci < cardItems.length) {
+      if (oi < oppItems.length) feedItems.push(oppItems[oi++]);
+      if (oi < oppItems.length) feedItems.push(oppItems[oi++]);
+      if (ci < cardItems.length) feedItems.push(cardItems[ci++]);
+    }
+  } else {
+    // Non-seller: growth cards first, then any opportunities
+    (cards || []).forEach(c => feedItems.push({ ...c, feed_type: 'growth_card' }));
+    (opps  || []).forEach(o => feedItems.push({ ...o, feed_type: 'opportunity' }));
+  }
+
+  res.json({
+    feed:        feedItems.slice(0, limit),
+    goals:       goals || [],
+    archetype,
+    has_opportunities: (opps?.length || 0) > 0,
+    has_cards:         (cards?.length || 0) > 0,
+    total_active_opps: opps?.length || 0,
+  });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/growth/cards/:id/read
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/cards/:id/read', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('growth_cards')
+    .update({ is_read: true })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+  res.json({ success: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/growth/cards/:id/dismiss
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/cards/:id/dismiss', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('growth_cards')
+    .update({ is_dismissed: true })
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+  res.json({ success: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/growth/checkin/today
+// Returns today's check-in. If none exists, generates fresh questions.
+// Questions are context-aware: tied to recent AI coach conversations.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/checkin/today', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+  const today  = new Date().toISOString().split('T')[0];
+
+  // Check if today's check-in already exists
+  const { data: existing } = await supabaseAdmin
+    .from('daily_check_ins')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('date', today)
+    .single();
+
+  if (existing) {
+    return res.json({ check_in: existing, is_new: false });
+  }
+
+  // Get recent AI coach context (last 3 conversations)
+  const { data: recentMessages } = await supabaseAdmin
+    .from('chat_messages')
+    .select('content, role')
+    .eq('user_id', userId)
+    .eq('role', 'assistant')
+    .order('created_at', { ascending: false })
+    .limit(6);
+
+  const chatContext = recentMessages
+    ?.map(m => m.content?.slice(0, 200))
+    .join(' | ')
+    .slice(0, 600) || '';
+
+  // Get active goals
+  const { data: goals } = await supabaseAdmin
+    .from('user_goals')
+    .select('goal_text, target_value, target_unit, current_value')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(2);
+
+  // Generate context-aware questions
+  const questions = await groqService.generateCheckInQuestions(
+    req.user, req.user.archetype || 'seller', chatContext, goals || []
+  );
+
+  // Save the new check-in
+  const { data: newCheckIn } = await supabaseAdmin
+    .from('daily_check_ins')
+    .insert({
+      user_id:      userId,
+      date:         today,
+      questions,
+      chat_context: chatContext,
+    })
+    .select()
+    .single();
+
+  res.json({ check_in: newCheckIn, is_new: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/growth/checkin
+// Submit answers to today's check-in.
+// AI responds, and generates tomorrow's tip based on the answers.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/checkin', asyncHandler(async (req, res) => {
+  const { answers, mood_score, date } = req.body;
+  const userId = req.user.id;
+  const today  = date || new Date().toISOString().split('T')[0];
+
+  if (!answers || typeof answers !== 'object') {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'answers required' });
+  }
+
+  // Get the check-in record
+  const { data: checkIn } = await supabaseAdmin
+    .from('daily_check_ins')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('date', today)
+    .single();
+
+  if (!checkIn) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'No check-in found for today' });
+  }
+
+  // Get active goals for response context
+  const { data: goals } = await supabaseAdmin
+    .from('user_goals')
+    .select('goal_text, current_value, target_value, target_unit')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(3);
+
+  // Generate AI response to the check-in
+  const { response_text, next_tip_seed } = await groqService.generateCheckInResponse(
+    req.user, req.user.archetype || 'seller', checkIn.questions, answers, goals || []
+  );
+
+  // Save answers + AI response
+  await supabaseAdmin
+    .from('daily_check_ins')
+    .update({
+      answers,
+      mood_score:  mood_score || null,
+      ai_response: response_text,
+      processed_at: new Date().toISOString()
+    })
+    .eq('id', checkIn.id);
+
+  // Update last check-in timestamp on user
+  await supabaseAdmin
+    .from('users')
+    .update({ last_check_in_at: new Date().toISOString() })
+    .eq('id', userId);
+
+  // Generate tomorrow's personalized tip card based on the check-in answers
+  // (async, don't block the response)
+  generateTipFromCheckIn(userId, req.user, answers, next_tip_seed, goals).catch(err =>
+    console.error('[CheckIn] Tip generation failed:', err.message)
+  );
+
+  res.json({
+    success:      true,
+    ai_response:  response_text,
+    message:      'Check-in saved. Your growth tip for tomorrow has been updated.'
+  });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GOALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/goals', asyncHandler(async (req, res) => {
+  const { data: goals } = await supabaseAdmin
+    .from('user_goals')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
+  res.json({ goals: goals || [] });
+}));
+
+router.post('/goals', asyncHandler(async (req, res) => {
+  const { goal_text, goal_type, target_value, target_unit, target_date } = req.body;
+
+  if (!goal_text?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'goal_text required' });
+  }
+
+  const { data: goal } = await supabaseAdmin
+    .from('user_goals')
+    .insert({
+      user_id:      req.user.id,
+      goal_text:    goal_text.trim(),
+      goal_type:    goal_type || 'custom',
+      target_value: target_value || null,
+      target_unit:  target_unit || null,
+      target_date:  target_date || null,
+    })
+    .select()
+    .single();
+
+  res.json({ success: true, goal });
+}));
+
+router.put('/goals/:id', asyncHandler(async (req, res) => {
+  const { current_value, status, goal_text } = req.body;
+  const updates = { updated_at: new Date().toISOString() };
+
+  if (current_value !== undefined) updates.current_value = current_value;
+  if (status !== undefined)        updates.status        = status;
+  if (goal_text !== undefined)     updates.goal_text     = goal_text;
+
+  const { data: goal } = await supabaseAdmin
+    .from('user_goals')
+    .update(updates)
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .select()
+    .single();
+
+  res.json({ success: true, goal });
+}));
+
+router.delete('/goals/:id', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('user_goals')
+    .delete()
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+  res.json({ success: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GOAL NOTES — Feature 6
+// POST   /api/growth/goals/:goalId/notes  — log a progress note, get AI coaching
+// GET    /api/growth/goals/:goalId/notes  — fetch note history
+// DELETE /api/growth/goals/:goalId/notes/:noteId — delete a note
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post('/goals/:goalId/notes', asyncHandler(async (req, res) => {
+  const { goalId } = req.params;
+  const { note_text } = req.body;
+
+  if (!note_text?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Note text is required' });
+  }
+
+  // Fetch goal and verify ownership
+  const { data: goal } = await supabaseAdmin
+    .from('user_goals')
+    .select('*')
+    .eq('id', goalId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!goal) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Goal not found' });
+  }
+
+  // Build Groq prompt
+  const systemPrompt = `
+You are an AI coach analyzing a founder's goal progress note.
+
+Goal: "${goal.goal_text}"
+Target: ${goal.target_value ?? 'not set'} ${goal.target_unit ?? ''}
+Current progress: ${goal.current_value ?? 0} / ${goal.target_value ?? '?'} ${goal.target_unit ?? ''}
+User's business: ${req.user.product_description ?? 'not provided'}
+
+The user just logged this note:
+"${note_text.trim()}"
+
+You must respond ONLY as JSON with this exact shape:
+{
+  "progress_delta": <number — extract any numeric progress from the note. 0 if none is mentioned. If the goal unit is currency and they mention an amount, extract that number. If it's a count, extract the count.>,
+  "coaching_response": "<2-4 sentences: 1) acknowledge what they did specifically, 2) relate it to their goal progress with the actual numbers, 3) give ONE specific concrete next action. Sound like a real coach, not an app. Never use filler phrases like 'Great job!' or 'Keep it up!'>",
+  "needs_tip_card": <true if they seem stuck, frustrated, or significantly behind target. false otherwise>,
+  "tip_context": "<if needs_tip_card is true: one sentence describing what kind of tip would help them right now. null otherwise>"
+}
+  `.trim();
+
+  // Primary AI call — user waits for this
+  const { content, tokens_in, tokens_out, model_used } = await callWithFallback({
+    systemPrompt,
+    messages: [{ role: 'user', content: 'Analyze this progress note and respond as instructed.' }],
+    temperature: 0.4,
+    maxTokens: 400,
+  });
+
+  await recordTokenUsage(req.user.id, 'groq', tokens_in, tokens_out);
+
+  // Parse Groq response
+  let parsed;
+  try {
+    const clean = content.replace(/```json|```/g, '').trim();
+    parsed = JSON.parse(clean);
+  } catch {
+    parsed = {
+      progress_delta:    0,
+      coaching_response: 'Note saved. Keep logging your progress — patterns will emerge over time.',
+      needs_tip_card:    false,
+      tip_context:       null,
+    };
+  }
+
+  const delta = parseFloat(parsed.progress_delta) || 0;
+
+  // Atomic goal progress update — cap at 0 to prevent negative values
+  if (delta !== 0) {
+    await supabaseAdmin.rpc('increment_goal_progress', {
+      p_goal_id: goalId,
+      p_delta:   delta,
+    });
+  }
+
+  // Compute new value and check for completion
+  const newValue = Math.max(0, (goal.current_value ?? 0) + delta);
+  if (goal.target_value && newValue >= goal.target_value && goal.status === 'active') {
+    await supabaseAdmin
+      .from('user_goals')
+      .update({ status: 'completed', completed_at: new Date().toISOString() })
+      .eq('id', goalId);
+  }
+
+  // Save the note with AI response
+  const { data: note } = await supabaseAdmin
+    .from('goal_notes')
+    .insert({
+      goal_id:        goalId,
+      user_id:        req.user.id,
+      note_text:      note_text.trim(),
+      ai_response:    parsed.coaching_response,
+      progress_delta: delta,
+    })
+    .select()
+    .single();
+
+  // Fire-and-forget tip card generation — do NOT await, user must not wait for this
+  if (parsed.needs_tip_card && parsed.tip_context) {
+    (async () => {
+      try {
+        const tipPrompt = `
+Generate a concise growth tip for a founder.
+Context: ${parsed.tip_context}
+Their goal: ${goal.goal_text}
+Their product: ${req.user.product_description ?? ''}
+
+Respond ONLY as JSON: { "title": "<10 words max>", "body": "<2-3 sentences of actionable advice>" }
+        `.trim();
+
+        const { content: tipContent, tokens_in: tIn, tokens_out: tOut } = await callWithFallback({
+          systemPrompt: tipPrompt,
+          messages: [{ role: 'user', content: 'Generate the tip.' }],
+          temperature: 0.5,
+          maxTokens: 150,
+        });
+
+        await recordTokenUsage(req.user.id, 'groq', tIn, tOut);
+
+        const tip = JSON.parse(tipContent.replace(/```json|```/g, '').trim());
+        await supabaseAdmin.from('growth_cards').insert({
+          user_id:      req.user.id,
+          card_type:    'tip',
+          title:        tip.title,
+          body:         tip.body,
+          action_label: 'Log more progress',
+          action_type:  'internal_goals',
+          priority:     7,
+          expires_at:   new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          generated_by: 'goal_note_ai',
+          metadata:     { goal_id: goalId },
+        });
+      } catch (err) {
+        console.error('[GoalNotes] Tip card generation failed (non-fatal):', err.message);
+      }
+    })();
+  }
+
+  res.status(201).json({
+    success:           true,
+    note,
+    coaching_response: parsed.coaching_response,
+    progress_delta:    delta,
+    new_value:         newValue,
+    goal_completed:    goal.target_value ? newValue >= goal.target_value : false,
+  });
+}));
+
+router.get('/goals/:goalId/notes', asyncHandler(async (req, res) => {
+  const { goalId } = req.params;
+
+  // Verify goal ownership first
+  const { data: goal } = await supabaseAdmin
+    .from('user_goals')
+    .select('id')
+    .eq('id', goalId)
+    .eq('user_id', req.user.id)
+    .single();
+
+  if (!goal) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Goal not found' });
+  }
+
+  const { data: notes } = await supabaseAdmin
+    .from('goal_notes')
+    .select('id, note_text, ai_response, progress_delta, created_at')
+    .eq('goal_id', goalId)
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(50);
+
+  res.json({ notes: notes || [] });
+}));
+
+router.delete('/goals/:goalId/notes/:noteId', asyncHandler(async (req, res) => {
+  await supabaseAdmin
+    .from('goal_notes')
+    .delete()
+    .eq('id', req.params.noteId)
+    .eq('user_id', req.user.id);
+  res.json({ success: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/growth/history
+// Returns paginated past daily tips and weekly plans for review.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/history', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+  const limit  = parseInt(req.query.limit) || 30;
+  const offset = parseInt(req.query.offset) || 0;
+  const type   = req.query.type; // 'tips' | 'plans' | undefined (all)
+
+  let query = supabaseAdmin
+    .from('growth_cards')
+    .select('id, card_type, title, body, action_label, generated_by, created_at, is_read, metadata')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (type === 'tips') {
+    query = query.in('card_type', ['tip', 'challenge', 'reflection', 'resource']);
+  } else if (type === 'plans') {
+    query = query.eq('card_type', 'strategy').eq('generated_by', 'ai_weekly');
+  } else {
+    // All — exclude real-time/manual cards that aren't AI-generated
+    query = query.in('generated_by', ['ai_daily', 'ai_weekly', 'ai_checkin']);
+  }
+
+  const { data: cards, error } = await query;
+  if (error) throw error;
+
+  res.json({ cards: cards || [], total: cards?.length || 0 });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/growth/archetype/detect
+// Re-detect and save the user's archetype
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/archetype/detect', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+
+  const { data: user } = await supabaseAdmin
+    .from('users')
+    .select('product_description, target_audience, role, industry, bio, onboarding_answers')
+    .eq('id', userId)
+    .single();
+
+  if (!user?.product_description) {
+    return res.status(400).json({ error: 'ONBOARDING_REQUIRED', message: 'Complete onboarding first' });
+  }
+
+  const result = await groqService.detectUserArchetype(user, user.onboarding_answers || {});
+
+  await supabaseAdmin
+    .from('users')
+    .update({
+      archetype:             result.archetype,
+      archetype_detected_at: new Date().toISOString()
+    })
+    .eq('id', userId);
+
+  res.json({ success: true, archetype: result.archetype, confidence: result.confidence });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/growth/plan
+// Weekly growth plan for this user
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/plan', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+
+  // Check if a plan exists from this week
+  const weekStart = getWeekStart();
+  const { data: existingCard } = await supabaseAdmin
+    .from('growth_cards')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('card_type', 'strategy')
+    .eq('generated_by', 'ai_weekly')
+    .gte('created_at', weekStart)
+    .single();
+
+  if (existingCard) {
+    return res.json({ plan: existingCard, cached: true });
+  }
+
+  // Generate a new weekly plan
+  const { data: goals } = await supabaseAdmin
+    .from('user_goals')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(3);
+
+  const { data: metrics } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  const plan = await groqService.generateWeeklyPlan(
+    req.user, req.user.archetype || 'seller', metrics, goals || []
+  );
+
+  // Save as a strategy card
+  const { data: card } = await supabaseAdmin
+    .from('growth_cards')
+    .insert({
+      user_id:      userId,
+      card_type:    'strategy',
+      title:        plan.title,
+      body:         plan.body,
+      action_label: 'View this week\'s plan',
+      action_type:  'internal_chat',
+      priority:     9,
+      expires_at:   getNextWeekStart(),
+      generated_by: 'ai_weekly',
+      metadata:     { daily_actions: plan.daily_actions, focus_area: plan.focus_area }
+    })
+    .select()
+    .single();
+
+  res.json({ plan: card, cached: false });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERNAL HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+const generateFirstTimeCards = async (userId, user) => {
+  console.log("Generating first time growth cards");
+  const archetype = user.archetype || 'seller';
+  const { data: goals } = await supabaseAdmin
+    .from('user_goals')
+    .select('goal_text, target_value, target_unit')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(2);
+
+  const tips = await groqService.generateDailyTips(user, archetype, goals || [], []);
+
+  const priorities = [8, 6, 4];
+  const expiresAt  = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  await supabaseAdmin.from('growth_cards').insert(
+    tips.map((tip, i) => ({
+      user_id:      userId,
+      card_type:    tip.card_type || 'tip',
+      title:        tip.title,
+      body:         tip.body,
+      action_label: tip.action_label,
+      action_type:  tip.action_type,
+      priority:     priorities[i] ?? 4,
+      expires_at:   expiresAt,
+      generated_by: 'ai_daily',
+      metadata:     tip.metadata || {}
+    }))
+  );
+
+  await supabaseAdmin
+    .from('users')
+    .update({ last_tip_generated_at: new Date().toISOString() })
+    .eq('id', userId);
+};
+
+const generateTipFromCheckIn = async (userId, user, answers, seed, goals) => {
+  const archetype = user.archetype || 'seller';
+  const recentCheckIns = [{ answers, seed }];
+
+  const tip = await groqService.generateDailyTip(user, archetype, goals, recentCheckIns);
+
+  await supabaseAdmin.from('growth_cards').insert({
+    user_id:      userId,
+    card_type:    tip.card_type || 'tip',
+    title:        tip.title,
+    body:         tip.body,
+    action_label: tip.action_label,
+    action_type:  tip.action_type,
+    priority:     9,             // higher priority since it's personalized from check-in
+    expires_at:   new Date(Date.now() + 36 * 60 * 60 * 1000).toISOString(),  // 36h expiry
+    generated_by: 'ai_checkin',
+    metadata:     tip.metadata || {}
+  });
+
+  await supabaseAdmin
+    .from('users')
+    .update({ last_tip_generated_at: new Date().toISOString() })
+    .eq('id', userId);
+};
+
+const getWeekStart = () => {
+  const d = new Date();
+  d.setDate(d.getDate() - d.getDay());
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+};
+
+const getNextWeekStart = () => {
+  const d = new Date();
+  d.setDate(d.getDate() + (7 - d.getDay()));
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+};
+
+export default router;

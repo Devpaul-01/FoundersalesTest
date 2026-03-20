@@ -1,0 +1,383 @@
+// src/jobs/index.js
+// ============================================================
+// BACKGROUND JOB REGISTRY
+//
+// FIXES:
+//  M-04 — All user queries now include .eq('is_deleted', false)
+//          so soft-deleted users are excluded from all background jobs.
+//  S-02 — aggregateUserMetrics now populates links_clicked and
+//          messages_copied (were always 0 before).
+// ============================================================
+
+import cron from 'node-cron';
+import {
+  JOB_INTERVALS, BATCH_SIZE, BATCH_DELAY_MS,
+  MIN_MESSAGES_FOR_SUMMARY, SUMMARIZE_EVERY_N_MESSAGES,
+  CALENDAR_PREP_HOURS_BEFORE
+} from '../config/constants.js';
+import { runMessageQueueWorker } from './messageQueueWorker.js';
+import { discoverOpportunities } from '../services/perplexity.js';
+import { recordTokenUsage } from '../services/tokenTracker.js';
+import { notifyUser, Notifications } from '../services/notifications.js';
+import groqService from '../services/groq.js';
+import supabaseAdmin from '../config/supabase.js';
+import {
+  runDailyTipGeneration,
+  runCheckInScheduler,
+  runWeeklyPlanGeneration,
+  runGoalNudgeJob,
+} from './growthIntelligenceScheduler.js';
+import { runFollowupSequenceJob } from './followupSequenceJob.js';
+import { runMemoryExtractionJob } from './memoryExtractionJob.js';
+import { runEmailDigestJob } from './emailDigestJob.js';
+
+
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const chunk = (arr, size) => Array.from(
+  { length: Math.ceil(arr.length / size) },
+  (_, i) => arr.slice(i * size, i * size + size)
+);
+
+const logJob = async (name, status, data = {}) => {
+  await supabaseAdmin.from('job_logs').insert({ job_name: name, status, ...data }).catch(() => {});
+};
+
+// ──────────────────────────────────────────
+// JOB: OPPORTUNITY FETCH (every 6h)
+// ──────────────────────────────────────────
+const runOpportunityJob = async () => {
+  const startTime = Date.now();
+  console.log(`[OpportunityJob] Starting ${new Date().toISOString()}`);
+  await logJob('opportunity_fetch', 'started');
+
+  let processed = 0, found = 0;
+
+  try {
+    // FIX M-04: Added .eq('is_deleted', false) — deleted users were still being processed
+    const { data: users } = await supabaseAdmin
+      .from('users')
+      .select('id, tier, product_description, target_audience, voice_profile, business_name, role, industry, fcm_token')
+      .eq('onboarding_completed', true)
+      .eq('is_deleted', false)            // ← NEW: skip soft-deleted users
+      .not('product_description', 'is', null);
+
+    if (!users?.length) {
+      await logJob('opportunity_fetch', 'completed', { users_processed: 0, opportunities_found: 0, duration_ms: Date.now() - startTime });
+      return;
+    }
+
+    for (const batch of chunk(users, BATCH_SIZE)) {
+      const results = await Promise.allSettled(batch.map(u => processUserOpportunities(u)));
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') { processed++; found += r.value?.found || 0; }
+        else console.error(`[OpportunityJob] User ${batch[i].id} failed:`, r.reason?.message);
+      });
+      await sleep(BATCH_DELAY_MS);
+    }
+
+    await logJob('opportunity_fetch', 'completed', {
+      users_processed: processed,
+      opportunities_found: found,
+      duration_ms: Date.now() - startTime
+    });
+  } catch (err) {
+    console.error('[OpportunityJob] Fatal:', err.message);
+    await logJob('opportunity_fetch', 'failed', { error_message: err.message });
+  }
+};
+
+const processUserOpportunities = async (user) => {
+  const result = await discoverOpportunities(user.id, user);
+  if (!result.opportunities?.length) return { found: 0 };
+
+  const { data: perfProfile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('learned_patterns, best_message_style, best_message_length')
+    .eq('user_id', user.id)
+    .single();
+
+  const scored = await groqService.scoreOpportunities(user, result.opportunities);
+  const qualifying = scored.filter(o =>
+    ((o.fit_score || 0) + (o.timing_score || 0) + (o.intent_score || 0)) / 3 >= 5
+  );
+
+  let newCount = 0;
+  for (const opp of qualifying) {
+    const { message, tokens_in, tokens_out } = await groqService.generateOutreachMessage(user, opp, perfProfile);
+    await recordTokenUsage(user.id, 'groq', tokens_in, tokens_out);
+
+    const { error } = await supabaseAdmin.from('opportunities').insert({
+      user_id: user.id,
+      platform: opp.platform || 'reddit',
+      source_url: opp.source_url,
+      target_context: opp.target_context,
+      prepared_message: message,
+      fit_score: opp.fit_score,
+      timing_score: opp.timing_score,
+      intent_score: opp.intent_score,
+      message_style: perfProfile?.best_message_style || 'empathetic',
+      message_length: message.split(' ').length,
+      generated_by: result.model_used,
+      status: 'pending',
+      stage: 'new'
+    });
+
+    if (!error) newCount++;
+    await sleep(300);
+  }
+
+  if (newCount > 0 && user.fcm_token) {
+    await notifyUser(user.id, Notifications.newOpportunities(newCount));
+  }
+
+  return { found: newCount };
+};
+
+// ──────────────────────────────────────────
+// JOB: FEEDBACK PROMPTS (hourly)
+// ──────────────────────────────────────────
+const runFeedbackPromptJob = async () => {
+  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+  const { data: opps } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, user_id')
+    .eq('status', 'sent')
+    .lt('marked_sent_at', cutoff)
+    .limit(100);
+
+  if (!opps?.length) return;
+
+  const { data: feedbackExists } = await supabaseAdmin
+    .from('feedback')
+    .select('opportunity_id')
+    .in('opportunity_id', opps.map(o => o.id));
+
+  const withFeedback = new Set(feedbackExists?.map(f => f.opportunity_id) || []);
+
+  // FIX M-04: Filter out deleted users via a join check
+  const { data: deletedUsers } = await supabaseAdmin
+    .from('users')
+    .select('id')
+    .eq('is_deleted', true)
+    .in('id', [...new Set(opps.map(o => o.user_id))]);
+  const deletedIds = new Set((deletedUsers || []).map(u => u.id));
+
+  const needPrompt = opps.filter(o =>
+    !withFeedback.has(o.id) && !deletedIds.has(o.user_id)
+  );
+
+  for (const opp of needPrompt) {
+    await notifyUser(opp.user_id, Notifications.feedbackPrompt({ opportunityId: opp.id }));
+    await sleep(200);
+  }
+
+  if (needPrompt.length > 0) console.log(`[FeedbackJob] Sent ${needPrompt.length} prompts`);
+};
+
+// ──────────────────────────────────────────
+// JOB: PERFORMANCE SUMMARIZATION (2am daily)
+// ──────────────────────────────────────────
+const runPerformanceSummaryJob = async () => {
+  console.log('[SummaryJob] Starting');
+
+  const { data: profiles } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('user_id, total_sent, messages_at_last_summary, last_summarized_at');
+
+  if (!profiles?.length) return;
+
+  const needsSummary = profiles.filter(p =>
+    p.total_sent >= MIN_MESSAGES_FOR_SUMMARY &&
+    (p.total_sent - (p.messages_at_last_summary || 0)) >= SUMMARIZE_EVERY_N_MESSAGES
+  );
+
+  for (const profile of needsSummary) {
+    await summarizeUserPerformance(profile.user_id);
+    await sleep(1500);
+  }
+
+  console.log(`[SummaryJob] Summarized ${needsSummary.length} users`);
+};
+
+const summarizeUserPerformance = async (userId) => {
+  try {
+    // FIX M-04: Check is_deleted before processing
+    const [{ data: user }, { data: sentOpps }, { data: feedbackData }] = await Promise.all([
+      supabaseAdmin.from('users')
+        .select('product_description, target_audience, voice_profile, is_deleted')
+        .eq('id', userId).single(),
+      supabaseAdmin.from('opportunities')
+        .select('id, platform, message_style, message_length')
+        .eq('user_id', userId).eq('status', 'done'),
+      supabaseAdmin.from('feedback')
+        .select('opportunity_id, outcome')
+        .eq('user_id', userId)
+    ]);
+
+    if (user?.is_deleted) return;  // ← skip deleted users
+    if (!sentOpps?.length || sentOpps.length < MIN_MESSAGES_FOR_SUMMARY) return;
+
+    const patterns = await groqService.summarizePerformancePatterns(user, sentOpps, feedbackData || []);
+    const positiveCount = feedbackData?.filter(f => f.outcome === 'positive').length || 0;
+
+    await supabaseAdmin.from('user_performance_profiles').upsert({
+      user_id: userId,
+      total_sent: sentOpps.length,
+      total_positive: positiveCount,
+      total_negative: (feedbackData?.length || 0) - positiveCount,
+      positive_rate: feedbackData?.length ? positiveCount / feedbackData.length : 0,
+      learned_patterns: patterns,
+      last_summarized_at: new Date().toISOString(),
+      messages_at_last_summary: sentOpps.length,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id' });
+  } catch (err) {
+    console.error(`[SummaryJob] Failed for ${userId}:`, err.message);
+  }
+};
+
+// ──────────────────────────────────────────
+// JOB: METRICS AGGREGATION (3am daily)
+// ──────────────────────────────────────────
+const runMetricsJob = async () => {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+
+  // FIX M-04: Only process non-deleted users
+  const { data: users } = await supabaseAdmin
+    .from('users')
+    .select('id')
+    .eq('onboarding_completed', true)
+    .eq('is_deleted', false);     // ← NEW
+
+  if (!users?.length) return;
+
+  for (const user of users) {
+    await aggregateUserMetrics(user.id, yesterday).catch(() => {});
+  }
+};
+
+const aggregateUserMetrics = async (userId, date) => {
+  const [{ data: opps }, { data: feedback }] = await Promise.all([
+    supabaseAdmin.from('opportunities')
+      .select('id, viewed_at, link_clicked_at, message_copied_at, marked_sent_at')
+      .eq('user_id', userId)
+      .gte('created_at', `${date}T00:00:00`)
+      .lte('created_at', `${date}T23:59:59`),
+    supabaseAdmin.from('feedback')
+      .select('outcome')
+      .eq('user_id', userId)
+      .gte('created_at', `${date}T00:00:00`)
+      .lte('created_at', `${date}T23:59:59`)
+  ]);
+
+  if (!opps?.length) return;
+
+  const sent = opps.filter(o => o.marked_sent_at).length;
+  const positive = feedback?.filter(f => f.outcome === 'positive').length || 0;
+
+  // FIX S-02: links_clicked and messages_copied were never populated.
+  await supabaseAdmin.from('daily_metrics').upsert({
+    user_id: userId,
+    date,
+    opportunities_shown: opps.length,
+    opportunities_viewed: opps.filter(o => o.viewed_at).length,
+    links_clicked: opps.filter(o => o.link_clicked_at).length,       // ← was always 0
+    messages_copied: opps.filter(o => o.message_copied_at).length,   // ← was always 0
+    messages_sent: sent,
+    positive_outcomes: positive,
+    negative_outcomes: (feedback?.length || 0) - positive,
+    execution_rate: opps.length > 0 ? sent / opps.length : 0,
+    positive_rate: sent > 0 ? positive / sent : 0
+  }, { onConflict: 'user_id,date' });
+};
+
+// ──────────────────────────────────────────
+// JOB: CALENDAR PREP (8am daily)
+// ──────────────────────────────────────────
+const runCalendarPrepJob = async () => {
+  const tomorrow = new Date(Date.now() + CALENDAR_PREP_HOURS_BEFORE * 3600000).toISOString().split('T')[0];
+  const today = new Date().toISOString().split('T')[0];
+
+  const { data: events } = await supabaseAdmin
+    .from('user_events')
+    .select('*, users(id, product_description, target_audience, voice_profile, business_name, fcm_token, is_deleted)')
+    .gte('event_date', today)
+    .lte('event_date', tomorrow)
+    .eq('prep_generated', false);
+
+  if (!events?.length) return;
+
+  for (const event of events) {
+    // FIX M-04: Skip events for deleted users
+    if (event.users?.is_deleted) continue;
+
+    try {
+      const prep = await groqService.generateEventPrep(event.users, event);
+      await supabaseAdmin.from('user_events').update({
+        prep_content: prep,
+        prep_generated: true,
+        prep_generated_at: new Date().toISOString()
+      }).eq('id', event.id);
+
+      if (event.users?.fcm_token) {
+        await notifyUser(event.users.id, {
+          title: `Prep ready for "${event.title}" 📋`,
+          body: 'Talking points and follow-up templates are ready. Tap to review.',
+          data: { type: 'event_prep', event_id: event.id }
+        });
+      }
+
+      await sleep(1000);
+    } catch (err) {
+      console.error(`[CalendarJob] Prep failed for event ${event.id}:`, err.message);
+    }
+  }
+
+  if (events.length > 0) console.log(`[CalendarJob] Prepped ${events.length} events`);
+};
+
+// ──────────────────────────────────────────
+// REGISTER ALL JOBS
+// ──────────────────────────────────────────
+export const startAllJobs = () => {
+  console.log('[Jobs] Registering background jobs...');
+
+  cron.schedule(JOB_INTERVALS.MESSAGE_QUEUE_WORKER, runMessageQueueWorker);
+  cron.schedule(JOB_INTERVALS.OPPORTUNITY_FETCH,    runOpportunityJob);
+  cron.schedule(JOB_INTERVALS.FEEDBACK_PROMPTS,     runFeedbackPromptJob);
+  cron.schedule(JOB_INTERVALS.PERFORMANCE_SUMMARY,  runPerformanceSummaryJob);
+  cron.schedule(JOB_INTERVALS.METRICS_AGGREGATION,  runMetricsJob);
+  cron.schedule(JOB_INTERVALS.CALENDAR_PREP,        runCalendarPrepJob);
+  cron.schedule(JOB_INTERVALS.DAILY_TIP_GENERATION, runDailyTipGeneration);
+  cron.schedule(JOB_INTERVALS.CHECK_IN_SCHEDULER,   runCheckInScheduler);
+  cron.schedule(JOB_INTERVALS.WEEKLY_PLAN,          runWeeklyPlanGeneration);
+  cron.schedule(JOB_INTERVALS.FOLLOW_UP_CHECK,      runFollowupSequenceJob);
+  cron.schedule(JOB_INTERVALS.MEMORY_EXTRACTION,    runMemoryExtractionJob);
+  cron.schedule(JOB_INTERVALS.EMAIL_DIGEST,         runEmailDigestJob);
+  cron.schedule(JOB_INTERVALS.GOAL_NUDGE_CHECK,     runGoalNudgeJob);
+
+  console.log('[Jobs] All registered:');
+  console.log('  Message queue worker:  every 30 seconds');
+  console.log('  Opportunity fetch:     every 6 hours');
+  console.log('  Feedback prompts:      every hour');
+  console.log('  Performance summary:   2am daily');
+  console.log('  Metrics aggregation:   3am daily');
+  console.log('  Calendar prep:         8am daily');
+  console.log('  Daily tip generation:  7am daily');
+  console.log('  Check-in scheduler:    2pm daily');
+  console.log('  Weekly plan:           6pm Sunday');
+  console.log('  Follow-up sequences:   10am daily    [Feature 1]');
+  console.log('  Memory extraction:     every 30 min  [Feature 2]');
+  console.log('  Email digest:          6pm Sunday    [Feature 3]');
+  console.log('  Goal nudge:            9am daily     [Feature 6]');
+};
+
+export {
+  runOpportunityJob,
+  runFeedbackPromptJob,
+  runPerformanceSummaryJob,
+  runMetricsJob,
+  runCalendarPrepJob
+};

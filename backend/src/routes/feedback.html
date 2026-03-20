@@ -1,0 +1,325 @@
+// src/routes/feedback.js
+// ============================================================
+// FEEDBACK SYSTEM V2 — AI event prep powered by Groq
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import { FEEDBACK_OUTCOMES, PIPELINE_STAGES, OPPORTUNITY_STATUS } from '../config/constants.js';
+import { notifyUser, Notifications } from '../services/notifications.js';
+import { generateEventPrep } from '../services/groq.js';
+import supabaseAdmin from '../config/supabase.js';
+
+const router = Router();
+
+// ──────────────────────────────────────────
+// POST /api/feedback
+// ──────────────────────────────────────────
+router.post('/', asyncHandler(async (req, res) => {
+  const {
+    opportunity_id,
+    outcome,
+    outcome_note,
+    deal_value_usd,
+    scheduled_call,
+    scheduled_call_date,
+    scheduled_call_notes,
+    is_final
+  } = req.body;
+
+  const userId = req.user.id;
+
+  if (!opportunity_id || !outcome) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: 'opportunity_id and outcome are required'
+    });
+  }
+
+  if (!Object.values(FEEDBACK_OUTCOMES).includes(outcome)) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: `outcome must be: ${Object.values(FEEDBACK_OUTCOMES).join(' | ')}`
+    });
+  }
+
+  const { data: opportunity, error: oppError } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, user_id, stage, target_name, target_context, platform')
+    .eq('id', opportunity_id)
+    .eq('user_id', userId)
+    .single();
+
+  if (oppError || !opportunity) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Opportunity not found' });
+  }
+
+  const { data: existingFeedback } = await supabaseAdmin
+    .from('feedback')
+    .select('id, outcome')
+    .eq('opportunity_id', opportunity_id)
+    .eq('user_id', userId)
+    .single();
+
+  if (existingFeedback) {
+    return res.status(409).json({
+      error: 'ALREADY_SUBMITTED',
+      message: 'Feedback already recorded for this opportunity'
+    });
+  }
+
+  const newStage = determineStage({
+    outcome, deal_value_usd, scheduled_call, is_final, currentStage: opportunity.stage
+  });
+
+  const { error: feedbackError } = await supabaseAdmin
+    .from('feedback')
+    .insert({
+      user_id:              userId,
+      opportunity_id,
+      outcome,
+      outcome_note:         outcome_note?.trim() || null,
+      deal_value_usd:       deal_value_usd ? parseInt(deal_value_usd) : null,
+      scheduled_call:       scheduled_call || false,
+      is_final:             is_final || false,
+      scheduled_call_date:  scheduled_call_date || null,
+      scheduled_call_notes: scheduled_call_notes?.trim() || null,
+      practice_suggested:   outcome === FEEDBACK_OUTCOMES.NEGATIVE
+    });
+
+  if (feedbackError) throw feedbackError;
+
+  await supabaseAdmin
+    .from('opportunities')
+    .update({ stage: newStage, status: OPPORTUNITY_STATUS.DONE })
+    .eq('id', opportunity_id);
+
+  await updatePerformanceStats(userId, outcome);
+
+  let calendarPrompt = null;
+  let eventCreated   = null;
+
+  if (scheduled_call && newStage === PIPELINE_STAGES.CALL_DEMO) {
+    const { data: newEvent } = await supabaseAdmin
+      .from('user_events')
+      .insert({
+        user_id:          userId,
+        title:            `Call with ${opportunity.target_name || 'prospect'}`,
+        event_date:       scheduled_call_date
+          ? new Date(scheduled_call_date).toISOString().split('T')[0]
+          : new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        event_type:       'call_demo',
+        notes:            scheduled_call_notes || `Follow-up from ${opportunity.platform} outreach`,
+        opportunity_id,
+        attendee_name:    opportunity.target_name,
+        attendee_context: opportunity.target_context
+      })
+      .select()
+      .single();
+
+    if (newEvent) {
+      eventCreated = newEvent;
+      generateAndSaveEventPrep(req.user, newEvent);
+      calendarPrompt = {
+        show:             true,
+        event_id:         newEvent.id,
+        suggested_title:  newEvent.title,
+        opportunity_id,
+        message:          "Call added to Clutch Calendar. AI prep (talking points, research) will be ready shortly."
+      };
+    }
+  }
+
+  if (outcome === FEEDBACK_OUTCOMES.NEGATIVE) {
+    const practiceType = detectScenarioFromNote(outcome_note);
+    return res.json({
+      success:     true,
+      outcome,
+      new_stage:   newStage,
+      calendar_prompt: null,
+      practice_suggestion: {
+        show:          true,
+        title:         "Turn this into a win",
+        message:       buildPracticeMessage(outcome_note, opportunity.platform),
+        cta:           "Start Practice Round",
+        scenario_type: practiceType,
+        action:        'OPEN_PRACTICE_MODE'
+      },
+      encouragement: getEncouragement(),
+      message:       "Tracked. Clutch gets smarter with every outcome."
+    });
+  }
+
+  return res.json({
+    success:         true,
+    outcome,
+    new_stage:       newStage,
+    calendar_prompt: calendarPrompt,
+    event_created:   eventCreated ? { id: eventCreated.id, title: eventCreated.title } : null,
+    practice_suggestion: { show: false },
+    celebration: {
+      show:    true,
+      message: newStage === PIPELINE_STAGES.CLOSED_WON
+        ? `🎉 Deal closed${deal_value_usd ? ` — $${deal_value_usd.toLocaleString()} logged` : ''}!`
+        : "Positive outcome! Keep the momentum going.",
+    },
+    message: "Logged. Clutch is learning what works for you."
+  });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/feedback/pending
+// ──────────────────────────────────────────
+router.get('/pending', asyncHandler(async (req, res) => {
+  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+  const { data } = await supabaseAdmin
+    .from('opportunities')
+    .select('id, platform, target_context, target_name, marked_sent_at, stage')
+    .eq('user_id', req.user.id)
+    .eq('status', OPPORTUNITY_STATUS.SENT)
+    .lt('marked_sent_at', cutoff)
+    .not('id', 'in',
+      supabaseAdmin.from('feedback').select('opportunity_id').eq('user_id', req.user.id)
+    )
+    .order('marked_sent_at', { ascending: true })
+    .limit(5);
+
+  res.json({ pending: data || [], count: data?.length || 0 });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/feedback/history
+// ──────────────────────────────────────────
+router.get('/history', asyncHandler(async (req, res) => {
+  const { limit = 30, offset = 0 } = req.query;
+
+  const { data: history, error } = await supabaseAdmin
+    .from('feedback')
+    .select(`
+      id, outcome, outcome_note, created_at,
+      deal_value_usd, scheduled_call, is_final,
+      practice_suggested, practice_accepted,
+      opportunities(platform, target_context, target_name, stage, source_url)
+    `)
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+  if (error) throw error;
+
+  const { data: profile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('total_sent, total_positive, total_negative, positive_rate, learned_patterns')
+    .eq('user_id', req.user.id)
+    .single();
+
+  res.json({
+    history: history || [],
+    stats: profile || { total_sent: 0, total_positive: 0, positive_rate: 0 }
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/feedback/practice-accepted
+// ──────────────────────────────────────────
+router.post('/practice-accepted', asyncHandler(async (req, res) => {
+  const { opportunity_id } = req.body;
+  if (opportunity_id) {
+    await supabaseAdmin
+      .from('feedback')
+      .update({ practice_accepted: true })
+      .eq('opportunity_id', opportunity_id)
+      .eq('user_id', req.user.id);
+  }
+  res.json({ success: true });
+}));
+
+// ──────────────────────────────────────────
+// HELPERS
+// ──────────────────────────────────────────
+
+function determineStage({ outcome, deal_value_usd, scheduled_call, is_final, currentStage }) {
+  if (outcome === FEEDBACK_OUTCOMES.NEGATIVE && is_final) return PIPELINE_STAGES.CLOSED_LOST;
+  if (outcome === FEEDBACK_OUTCOMES.POSITIVE && deal_value_usd) return PIPELINE_STAGES.CLOSED_WON;
+  if (outcome === FEEDBACK_OUTCOMES.POSITIVE && scheduled_call) return PIPELINE_STAGES.CALL_DEMO;
+  if (outcome === FEEDBACK_OUTCOMES.POSITIVE) return PIPELINE_STAGES.REPLIED;
+  return currentStage !== PIPELINE_STAGES.NEW && currentStage !== PIPELINE_STAGES.CONTACTED
+    ? currentStage
+    : PIPELINE_STAGES.CONTACTED;
+}
+
+async function updatePerformanceStats(userId, outcome) {
+  const isPositive = outcome === FEEDBACK_OUTCOMES.POSITIVE;
+  const { data: profile } = await supabaseAdmin
+    .from('user_performance_profiles')
+    .select('total_sent, total_positive, total_negative')
+    .eq('user_id', userId)
+    .single();
+
+  const newSent     = (profile?.total_sent     || 0) + 1;
+  const newPositive = (profile?.total_positive  || 0) + (isPositive ? 1 : 0);
+  const newNegative = (profile?.total_negative  || 0) + (isPositive ? 0 : 1);
+
+  await supabaseAdmin
+    .from('user_performance_profiles')
+    .upsert({
+      user_id:       userId,
+      total_sent:    newSent,
+      total_positive: newPositive,
+      total_negative: newNegative,
+      positive_rate:  newPositive / newSent
+    }, { onConflict: 'user_id' });
+}
+
+async function generateAndSaveEventPrep(user, event) {
+  try {
+    const prep = await generateEventPrep(user, event);
+    await supabaseAdmin
+      .from('user_events')
+      .update({
+        prep_generated:    true,
+        prep_content:      prep,
+        prep_generated_at: new Date().toISOString()
+      })
+      .eq('id', event.id);
+  } catch (err) {
+    console.warn('[Feedback] Event prep generation failed:', err.message);
+  }
+}
+
+function buildPracticeMessage(note, platform) {
+  const n = note?.toLowerCase() || '';
+  if (n.includes('ghost') || n.includes('no response') || n.includes('ignored')) {
+    return "Getting ghosted is the most common outcome in outreach. A 3-minute practice session will help you write messages that get noticed — and make ghosting sting less.";
+  }
+  if (n.includes('price') || n.includes('expensive') || n.includes('cost')) {
+    return "Price objections mean interest — they just need more convincing. Practice handling this exact scenario to sharpen your response.";
+  }
+  if (n.includes('later') || n.includes('busy') || n.includes('timing')) {
+    return "Timing objections are recoverable. Practice re-engaging 'not right now' prospects and learn when to push vs when to wait.";
+  }
+  return "Every negative outcome teaches you something. A quick practice round will help you handle this better next time.";
+}
+
+function detectScenarioFromNote(note) {
+  const n = note?.toLowerCase() || '';
+  if (n.includes('ghost') || n.includes('no response')) return 'ghost';
+  if (n.includes('price') || n.includes('expensive') || n.includes('budget')) return 'price_objection';
+  if (n.includes('later') || n.includes('timing') || n.includes('busy')) return 'not_right_time';
+  if (n.includes('skeptic') || n.includes('doubt') || n.includes('prove')) return 'skeptical';
+  return 'polite_decline';
+}
+
+function getEncouragement() {
+  const msgs = [
+    "The best closers get rejected constantly. It's how they learn faster.",
+    "Every 'no' you survive makes the next one easier.",
+    "Outreach is a volume game. The founders who win send more, not better.",
+    "Reid Hoffman got 6 rejections for LinkedIn's first funding round.",
+    "Rejection rate doesn't define success. Outreach rate does."
+  ];
+  return msgs[Math.floor(Math.random() * msgs.length)];
+}
+
+export default router;

@@ -1,0 +1,462 @@
+// src/routes/auth.js
+// ============================================================
+// AUTH ROUTES
+//
+// POST   /api/auth/register         — Email+password signup
+// POST   /api/auth/login            — Email+password login
+// POST   /api/auth/logout           — Logout (invalidate session)
+// POST   /api/auth/refresh          — Refresh access token
+// GET    /api/auth/me               — Get current user profile
+// POST   /api/auth/profile/ensure   — Create profile after OAuth/email verify
+// GET    /api/auth/google/url       — Get Google OAuth redirect URL
+//
+// EMAIL VERIFICATION FLOW:
+//   1. Register → Supabase sends verification email (email_confirm: false)
+//   2. User clicks link → redirect to /auth/callback in frontend
+//   3. Frontend calls POST /api/auth/profile/ensure with JWT
+//   4. Profile created → redirect to /onboarding
+//
+// GOOGLE OAUTH FLOW:
+//   1. GET /api/auth/google/url → returns Supabase OAuth URL
+//   2. User authenticates with Google
+//   3. Supabase redirects to /auth/callback with tokens in URL hash
+//   4. Frontend calls POST /api/auth/profile/ensure
+//   5. Profile created/confirmed → redirect to dashboard or onboarding
+//
+// ROLLBACK FIX:
+//   If profile creation fails after auth user is created, we retry
+//   up to 3 times with exponential backoff. If all retries fail,
+//   we delete the orphaned auth user and log the failure with full
+//   context so it can be investigated and the user can retry.
+// ============================================================
+
+import { Router } from 'express';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import supabaseAdmin from '../config/supabase.js';
+import authenticate from '../middleware/auth.js';
+
+const router = Router();
+
+// ──────────────────────────────────────────
+// POST /api/auth/register
+// ──────────────────────────────────────────
+router.post('/register', asyncHandler(async (req, res) => {
+  const { name, email, password } = req.body;
+
+  if (!email?.trim()) return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Email is required' });
+  if (!password)      return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Password is required' });
+  if (password.length < 8) return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Password must be at least 8 characters' });
+
+  // Step 1: Create Supabase auth user
+  // email_confirm: false → Supabase sends a verification email
+  // email_confirm: true  → auto-confirm (useful for local dev / Google OAuth)
+  /*
+  const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+    email:          email.trim().toLowerCase(),
+    password,
+    email_confirm:  false,   // User must verify email
+    user_metadata:  { name: name?.trim() || '' }
+  });
+  */
+  const { data: authData, error: authError } = await supabaseAdmin.auth.signUp({
+  email:    email.trim().toLowerCase(),
+  password,
+  options: {
+    data:        { name: name?.trim() || '' },
+    emailRedirectTo: process.env.OAUTH_REDIRECT_URL || 
+                     `${process.env.FRONTEND_URL}/auth/callback`
+  }
+});
+
+  
+  if (authError) {
+  if (authError.message?.toLowerCase().includes('already registered') ||
+      authError.message?.toLowerCase().includes('user already registered')) {
+    return res.status(409).json({
+      error:   'EMAIL_TAKEN',
+      message: 'An account with this email already exists. Please sign in.'
+    });
+  }
+  return res.status(400).json({
+    error:   'REGISTRATION_ERROR',
+    message: authError.message || 'Registration failed. Please try again.'
+  });
+}
+
+// signUp returns data.user (not data.authData.user)
+const userId = authData.user?.id;
+if (!userId) {
+  return res.status(500).json({
+    error:   'REGISTRATION_FAILED',
+    message: 'Account setup failed. Please try again.'
+  });
+}
+
+  
+
+  // Step 2: Create user profile in our users table (with retry + rollback)
+  const profileCreated = await createUserProfileWithRetry(userId, {
+    name:  name?.trim() || null,
+    email: email.trim().toLowerCase(),
+    tier:  'free',
+  });
+
+  if (!profileCreated) {
+    // All retries exhausted — rollback: delete the orphaned auth user
+    console.error(`[Auth] Profile creation failed after all retries for userId=${userId}, email=${email}. Rolling back auth user.`);
+
+    await deleteAuthUserWithRetry(userId);
+
+    return res.status(500).json({
+      error:   'REGISTRATION_FAILED',
+      message: 'Account setup failed. Please try again in a moment.'
+    });
+  }
+
+  // Registration succeeded — user needs to verify email before logging in
+  res.status(201).json({
+    success:          true,
+    needsVerification: true,
+    message:          'Account created! Please check your email to verify your account before signing in.',
+    email:            email.trim().toLowerCase()
+  });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/auth/login
+// ──────────────────────────────────────────
+router.post('/login', asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email?.trim()) return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Email is required' });
+  if (!password)      return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Password is required' });
+
+  const { data, error } = await supabaseAdmin.auth.signInWithPassword({
+    email:    email.trim().toLowerCase(),
+    password
+  });
+
+  if (error) {
+    // Map Supabase error messages to user-friendly ones
+    if (error.message?.toLowerCase().includes('email not confirmed')) {
+      return res.status(403).json({
+        error:             'EMAIL_NOT_VERIFIED',
+        message:           'Please verify your email address before signing in. Check your inbox.',
+        needsVerification: true,
+        email:             email.trim().toLowerCase()
+      });
+    }
+    if (error.message?.toLowerCase().includes('invalid login') ||
+        error.message?.toLowerCase().includes('invalid credentials') ||
+        error.message?.toLowerCase().includes('wrong password')) {
+      return res.status(401).json({
+        error:   'INVALID_CREDENTIALS',
+        message: 'Incorrect email or password. Please try again.'
+      });
+    }
+    return res.status(401).json({
+      error:   'LOGIN_FAILED',
+      message: error.message || 'Login failed. Please try again.'
+    });
+  }
+
+  // Fetch full profile
+  const { data: profile } = await supabaseAdmin
+    .from('users')
+    .select('*')
+    .eq('id', data.user.id)
+    .single();
+
+  if (profile?.is_deleted) {
+    return res.status(403).json({
+      error:   'ACCOUNT_DELETED',
+      message: 'This account has been deleted.'
+    });
+  }
+
+  res.json({
+    user:    profile || { id: data.user.id, email: data.user.email },
+    session: {
+      access_token:  data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      expires_at:    data.session.expires_at
+    }
+  });
+}));
+/*
+// ──────────────────────────────────────────
+// POST /api/auth/logout
+// ──────────────────────────────────────────
+router.post('/logout', asyncHandler(async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    // Best-effort: sign out from Supabase (invalidates refresh token)
+    await supabaseAdmin.auth.admin.signOut(token).catch(() => {});
+  }
+  res.json({ success: true });
+}));
+*/
+router.post('/logout', asyncHandler(async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    // Use admin.signOut with the token directly — avoids setting
+    // session state on the shared supabaseAdmin singleton
+    await supabaseAdmin.auth.admin.signOut(token).catch((err) => {
+      console.warn('[Auth] Logout signOut failed (non-critical):', err.message);
+    });
+  }
+  res.json({ success: true });
+}));
+// ──────────────────────────────────────────
+// POST /api/auth/refresh
+// ──────────────────────────────────────────
+router.post('/refresh', asyncHandler(async (req, res) => {
+  const { refresh_token } = req.body;
+
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'refresh_token is required' });
+  }
+
+  const { data, error } = await supabaseAdmin.auth.refreshSession({ refresh_token });
+
+  if (error || !data?.session) {
+    return res.status(401).json({
+      error:   'REFRESH_FAILED',
+      message: 'Session expired. Please sign in again.'
+    });
+  }
+
+  res.json({
+    session: {
+      access_token:  data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      expires_at:    data.session.expires_at
+    }
+  });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/auth/me
+// ──────────────────────────────────────────
+router.get('/me', authenticate, asyncHandler(async (req, res) => {
+  const { data: profile, error } = await supabaseAdmin
+    .from('users')
+    .select('*')
+    .eq('id', req.user.id)
+    .single();
+
+  if (error || !profile) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'User profile not found' });
+  }
+
+  res.json({ user: profile });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/auth/profile/ensure
+// Creates user profile after OAuth or email verification.
+// This route verifies the JWT independently (no profile required yet).
+// ──────────────────────────────────────────
+router.post('/profile/ensure', asyncHandler(async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Authentication required' });
+  }
+
+  const token = authHeader.slice(7);
+  const { data: { user: authUser }, error: verifyError } = await supabaseAdmin.auth.getUser(token);
+
+  if (verifyError || !authUser) {
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Invalid or expired token' });
+  }
+
+  // Check if profile already exists
+  const { data: existingProfile } = await supabaseAdmin
+    .from('users')
+    .select('id, onboarding_completed, archetype, tier')
+    .eq('id', authUser.id)
+    .single();
+
+  if (existingProfile) {
+    // Profile exists — just return it
+    return res.json({
+      user:      existingProfile,
+      isNewUser: false
+    });
+  }
+
+  // Create the profile (Google OAuth users or re-registration)
+  const name  = authUser.user_metadata?.full_name || authUser.user_metadata?.name || null;
+  const email = authUser.email;
+
+  const { data: newProfile, error: profileError } = await supabaseAdmin
+    .from('users')
+    .insert({
+      id:    authUser.id,
+      email,
+      name:  name?.trim() || null,
+      tier:  'free',
+    })
+    .select()
+    .single();
+
+  if (profileError) {
+    console.error(`[Auth] Profile ensure failed for userId=${authUser.id}:`, profileError.message);
+    return res.status(500).json({
+      error:   'PROFILE_CREATION_FAILED',
+      message: 'Could not create your profile. Please try again.'
+    });
+  }
+
+  res.status(201).json({
+    user:      newProfile,
+    isNewUser: true
+  });
+}));
+
+// ──────────────────────────────────────────
+// GET /api/auth/google/url
+// Returns the Supabase Google OAuth redirect URL
+// ──────────────────────────────────────────
+router.get('/google/url', asyncHandler(async (req, res) => {
+  const redirectTo = process.env.OAUTH_REDIRECT_URL || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/auth/callback`;
+
+  const { data, error } = await supabaseAdmin.auth.signInWithOAuth({
+    provider:    'google',
+    options: {
+      redirectTo,
+      queryParams: {
+        access_type: 'offline',
+        prompt:      'consent'
+      }
+    }
+  });
+
+  if (error || !data?.url) {
+    return res.status(500).json({
+      error:   'OAUTH_ERROR',
+      message: 'Could not generate Google sign-in URL. Please try again.'
+    });
+  }
+
+  res.json({ url: data.url });
+}));
+
+// ──────────────────────────────────────────
+// POST /api/auth/resend-verification
+// ──────────────────────────────────────────
+router.post('/resend-verification', asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  if (!email?.trim()) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Email is required' });
+  }
+
+  // Supabase handles rate limiting on this
+  const { error } = await supabaseAdmin.auth.resend({
+    type:  'signup',
+    email: email.trim().toLowerCase()
+  });
+
+  // Always return 200 — don't reveal if email exists
+  res.json({ success: true, message: 'If an account with this email exists, a verification email has been sent.' });
+}));
+
+// ──────────────────────────────────────────
+// INTERNAL HELPERS
+// ──────────────────────────────────────────
+
+/**
+ * Creates user profile with exponential backoff retry.
+ * Returns true on success, false if all retries exhausted.
+ */
+ 
+ const createUserProfileWithRetry = async (userId, data, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Use RPC with SECURITY DEFINER — bypasses RLS entirely.
+      // Avoids the supabaseAdmin session contamination issue where
+      // a previous user's JWT bleeds into the singleton client.
+      const { error } = await supabaseAdmin.rpc('create_user_profile', {
+        p_id:    userId,
+        p_email: data.email,
+        p_name:  data.name  || null,
+        p_tier:  data.tier  || 'free',
+      });
+
+      if (!error) return true;
+
+      // ON CONFLICT DO NOTHING means profile already exists — treat as success
+      console.log(`[Auth] Profile RPC attempt ${attempt}/${maxRetries} for userId=${userId}:`, error.message);
+
+      if (attempt < maxRetries) await sleep(attempt * 500);
+    } catch (err) {
+      console.error(`[Auth] Profile RPC exception attempt ${attempt}/${maxRetries}:`, err.message);
+      if (attempt < maxRetries) await sleep(attempt * 500);
+    }
+  }
+  return false;
+};
+
+/*
+const createUserProfileWithRetry = async (userId, data, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { error } = await supabaseAdmin
+        .from('users')
+        .insert({
+          id:    userId,
+          email: data.email,
+          name:  data.name || null,
+          tier:  data.tier || 'free',
+        });
+
+      if (!error) return true;
+
+      // Duplicate key = profile already exists (race with OAuth). Treat as success.
+      if (error.message?.includes('duplicate key') || error.message?.includes('unique constraint')) {
+        console.log(`[Auth] Profile already exists for userId=${userId} — treating as success`);
+        return true;
+      }
+
+      console.error(`[Auth] Profile insert attempt ${attempt}/${maxRetries} failed for userId=${userId}:`, error.message);
+
+      if (attempt < maxRetries) {
+        await sleep(attempt * 500); // 500ms, 1000ms, 1500ms backoff
+      }
+    } catch (err) {
+      console.error(`[Auth] Profile insert exception attempt ${attempt}/${maxRetries} for userId=${userId}:`, err.message);
+      if (attempt < maxRetries) await sleep(attempt * 500);
+    }
+  }
+  return false;
+};
+*/
+
+/**
+ * Delete orphaned auth user with retry.
+ * Logs failures but doesn't throw — we still want to return 500 to the user.
+ */
+const deleteAuthUserWithRetry = async (userId, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
+      if (!error) {
+        console.log(`[Auth] Rollback: deleted orphaned auth user userId=${userId}`);
+        return;
+      }
+      console.error(`[Auth] Rollback attempt ${attempt}/${maxRetries} failed for userId=${userId}:`, error.message);
+      if (attempt < maxRetries) await sleep(attempt * 1000);
+    } catch (err) {
+      console.error(`[Auth] Rollback exception attempt ${attempt}/${maxRetries} for userId=${userId}:`, err.message);
+      if (attempt < maxRetries) await sleep(attempt * 1000);
+    }
+  }
+  // If rollback fails: the auth user is orphaned. Alert for manual cleanup.
+  console.error(`[Auth] CRITICAL: Could not roll back orphaned auth user userId=${userId}. Manual cleanup required.`);
+};
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+export default router;

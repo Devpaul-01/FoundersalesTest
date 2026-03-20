@@ -1,0 +1,205 @@
+// src/app.js
+// ============================================================
+// CLUTCH AI - MAIN APPLICATION V2
+//
+// FIXES:
+//  SEC-1: Removed service role key prefix from startup logs
+//  SEC-2: Added rate limiting on auth and AI routes
+//  ARCH:  Inline routes moved to routes/user.js and routes/auth.js
+// ============================================================
+
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
+import { initFirebase } from './config/firebase.js';
+import authenticate from './middleware/auth.js';
+import { errorHandler } from './middleware/errorHandler.js';
+
+// Routes
+import authRoutes from './routes/auth.js';
+import userRoutes, { updateProfile, deleteAccount } from './routes/user.js';
+import onboardingRoutes from './routes/onboarding.js';
+import opportunitiesRoutes from './routes/opportunities.js';
+import feedbackRoutes from './routes/feedback.js';
+import practiceRoutes from './routes/practice.js';
+import metricsRoutes from './routes/metrics.js';
+import coachRoutes from './routes/coach.js';
+import pipelineRoutes from './routes/pipeline.js';
+import chatRoutes from './routes/chat.js';
+import calendarRoutes from './routes/calendar.js';
+import uploadRoutes from './routes/upload.js';
+import suggestionsRoutes from './routes/suggestions.js';
+import growthRoutes from './routes/growth.js';
+import followupRoutes from './routes/followup.js';
+
+import { startAllJobs } from './jobs/index.js';
+
+const app  = express();
+const PORT = process.env.PORT || 3001;
+
+// ──────────────────────────────────────────
+// RATE LIMITERS
+// ──────────────────────────────────────────
+
+// Auth routes: strict limits to prevent brute force
+const authRateLimiter = rateLimit({
+  windowMs:         15 * 60 * 1000,  // 15 minutes
+  max:              10,               // 10 attempts per window
+  standardHeaders:  true,
+  legacyHeaders:    false,
+  keyGenerator:     (req) => req.ip,
+  message: {
+    error:   'RATE_LIMIT_EXCEEDED',
+    message: 'Too many attempts. Please try again in 15 minutes.'
+  },
+  skip: (req) => req.path === '/refresh', // Don't limit token refresh
+});
+
+// AI/chat routes: per-user limits to prevent cost abuse
+const aiRateLimiter = rateLimit({
+  windowMs:         60 * 1000,   // 1 minute
+  max:              30,           // 30 AI requests per minute per user
+  standardHeaders:  true,
+  legacyHeaders:    false,
+  keyGenerator:     (req) => req.user?.id || req.ip,
+  message: {
+    error:   'RATE_LIMIT_EXCEEDED',
+    message: 'Too many requests. Please slow down.'
+  }
+});
+
+// Opportunity refresh: prevent expensive repeated background job triggers
+const refreshRateLimiter = rateLimit({
+  windowMs:         60 * 60 * 1000, // 1 hour
+  max:              5,               // 5 manual refreshes per hour
+  standardHeaders:  true,
+  legacyHeaders:    false,
+  keyGenerator:     (req) => req.user?.id || req.ip,
+  message: {
+    error:   'RATE_LIMIT_EXCEEDED',
+    message: 'You can refresh your feed up to 5 times per hour.'
+  }
+});
+
+// ──────────────────────────────────────────
+// MIDDLEWARE
+// ──────────────────────────────────────────
+app.use(helmet({
+  crossOriginEmbedderPolicy: false  // Allow SSE streaming
+}));
+
+app.use(cors({
+  origin: (origin, callback) => {
+    const allowed = [
+      process.env.FRONTEND_URL    || 'http://localhost:5173',
+      process.env.FRONTEND_URL_2  || null,
+      'http://localhost:5173',
+      'http://localhost:3000',
+    ].filter(Boolean);
+
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: Origin ${origin} not allowed`));
+    }
+  },
+  credentials: true
+}));
+
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+app.use(express.json({ limit: '2mb' }));
+
+// Trust proxy for correct IP in rate limiting (Railway, Render, etc.)
+app.set('trust proxy', 1);
+
+// ──────────────────────────────────────────
+// PUBLIC ROUTES
+// ──────────────────────────────────────────
+app.get('/health', (req, res) => res.json({
+  status:    'ok',
+  version:   '2.0.0',
+  timestamp: new Date().toISOString()
+}));
+
+// Auth routes (public — login/register don't need auth)
+app.use('/api/auth', authRateLimiter, authRoutes);
+
+// Profile update + account deletion (authenticated, under /api/auth prefix to match frontend expectations)
+app.put('/api/auth/me',      authenticate, updateProfile);
+app.delete('/api/auth/account', authenticate, deleteAccount);
+
+// ──────────────────────────────────────────
+// PROTECTED ROUTES
+// ──────────────────────────────────────────
+app.use('/api/user',         authenticate, userRoutes);
+app.use('/api/onboarding',   authenticate, onboardingRoutes);
+app.use('/api/suggestions',  authenticate, suggestionsRoutes);
+app.use('/api/opportunities',authenticate, opportunitiesRoutes);
+app.use('/api/feedback',     authenticate, feedbackRoutes);
+app.use('/api/practice',     authenticate, practiceRoutes);
+app.use('/api/metrics',      authenticate, metricsRoutes);
+app.use('/api/coach',        authenticate, coachRoutes);
+app.use('/api/pipeline',     authenticate, pipelineRoutes);
+app.use('/api/chat',         authenticate, aiRateLimiter, chatRoutes);
+app.use('/api/calendar',     authenticate, calendarRoutes);
+app.use('/api/upload',       authenticate, uploadRoutes);
+app.use('/api/growth',       authenticate, growthRoutes);
+app.use('/api/followup',     authenticate, followupRoutes);
+
+// ──────────────────────────────────────────
+// ERROR HANDLING
+// ──────────────────────────────────────────
+app.use('*', (req, res) => res.status(404).json({
+  error:   'NOT_FOUND',
+  message: `${req.method} ${req.originalUrl} not found`
+}));
+app.use(errorHandler);
+
+// ──────────────────────────────────────────
+// START
+// ──────────────────────────────────────────
+const startServer = async () => {
+  initFirebase();
+
+  app.listen(PORT, () => {
+    console.log('');
+    console.log('🚀 Clutch AI Backend v2 started');
+    // FIX SEC-1: Removed service key partial exposure from logs
+    console.log(`   Supabase connected: ${!!process.env.SUPABASE_URL}`);
+    console.log(`   Port:    ${PORT}`);
+    console.log(`   Mode:    ${process.env.NODE_ENV}`);
+    console.log('');
+    console.log('   Routes registered:');
+    console.log('   GET  /health');
+    console.log('   POST /api/auth/register | login | logout | refresh');
+    console.log('   GET  /api/auth/google/url');
+    console.log('   POST /api/auth/profile/ensure');
+    console.log('   GET  /api/auth/me');
+    console.log('   PUT  /api/auth/me');
+    console.log('   DELETE /api/auth/account');
+    console.log('   PUT  /api/user/fcm-token | debug | notification-preferences');
+    console.log('   POST /api/onboarding/basic | answers');
+    console.log('   GET  /api/opportunities | POST /refresh');
+    console.log('   POST /api/feedback');
+    console.log('   GET  /api/pipeline');
+    console.log('   POST /api/chat/:id/stream  [SSE]');
+    console.log('   POST /api/practice/start');
+    console.log('   GET  /api/metrics/dashboard');
+    console.log('   GET  /api/calendar');
+    console.log('   POST /api/upload');
+    console.log('');
+  });
+
+  startAllJobs();
+};
+
+startServer().catch(err => {
+  console.error('Failed to start:', err);
+  process.exit(1);
+});
+
+export default app;

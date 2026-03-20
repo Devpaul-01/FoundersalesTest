@@ -1,0 +1,187 @@
+// src/hooks/useStream.js
+// ============================================================
+// SSE STREAMING HOOK
+//
+// FIX M-06: Error detection was:
+//   if (parsed.message && !parsed.token && !parsed.id)
+//
+// This is too broad — ANY {message: "..."} payload would trigger the
+// error handler (e.g. status messages, notifications, or future fields).
+//
+// Fix: track the `event:` line that precedes each `data:` line.
+// SSE spec: event type is set by the "event:" field, so we use that
+// to correctly dispatch message_id / token / complete / error events.
+// ============================================================
+
+import { useRef, useState, useCallback, useEffect } from 'react'
+import { getAccessToken } from '../services/api'
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+
+export function useStream({ chatId, onMessageId, onComplete, onError }) {
+  const [isStreaming, setIsStreaming] = useState(false)
+  const [streamContent, setStreamContent] = useState('')
+  const bufferRef = useRef('')
+  const rafRef = useRef(null)
+  const abortRef = useRef(null)
+
+  const flush = useCallback(() => {
+    setStreamContent(bufferRef.current)
+  }, [])
+
+  const startStream = useCallback(async (content, attachmentIds = []) => {
+    if (!chatId) return
+
+    // Cancel any previous stream
+    abortRef.current?.abort()
+    abortRef.current = new AbortController()
+
+    setIsStreaming(true)
+    setStreamContent('')
+    bufferRef.current = ''
+
+    const token = getAccessToken()
+
+    try {
+      const response = await fetch(`${API_URL}/api/chat/${chatId}/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'text/event-stream',
+        },
+        body: JSON.stringify({ content, attachment_ids: attachmentIds }),
+        signal: abortRef.current.signal,
+      })
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.message || `Request failed (${response.status})`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let rawBuffer = ''
+
+      // FIX M-06: Track the current event type from `event:` lines
+      // so we can dispatch correctly — no more guessing from payload shape.
+      let lastEventType = 'message'
+
+      const read = async () => {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          rawBuffer += decoder.decode(value, { stream: true })
+          const lines = rawBuffer.split('\n')
+          rawBuffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed) {
+              lastEventType = 'message'  // Reset per SSE spec (blank line = end of event)
+              continue
+            }
+
+            // Track event type — this is the fix
+            if (trimmed.startsWith('event: ')) {
+              lastEventType = trimmed.slice(7).trim()
+              continue
+            }
+
+            if (!trimmed.startsWith('data: ')) continue
+
+            const raw = trimmed.slice(6)
+            if (raw === '{}' || !raw) continue
+
+            try {
+              const parsed = JSON.parse(raw)
+
+              // Dispatch based on event type field — not payload shape guessing
+              switch (lastEventType) {
+                case 'message_id':
+                  onMessageId?.(parsed.id)
+                  break
+
+                case 'token':
+                  if (parsed.token !== undefined) {
+                    bufferRef.current += parsed.token
+                    if (!rafRef.current) {
+                      rafRef.current = requestAnimationFrame(() => {
+                        flush()
+                        rafRef.current = null
+                      })
+                    }
+                  }
+                  break
+
+                case 'complete':
+                  flush()
+                  setIsStreaming(false)
+                  onComplete?.(bufferRef.current, parsed.message_id)
+                  break
+
+                case 'error':
+                  setIsStreaming(false)
+                  onError?.(parsed.message || 'Unknown error')
+                  break
+
+                case 'done':
+                  // Stream ended cleanly
+                  setIsStreaming(false)
+                  break
+
+                default:
+                  // Legacy / fallback: handle responses without event: lines
+                  if (parsed.token !== undefined) {
+                    bufferRef.current += parsed.token
+                    if (!rafRef.current) {
+                      rafRef.current = requestAnimationFrame(() => {
+                        flush()
+                        rafRef.current = null
+                      })
+                    }
+                  } else if (parsed.id && !parsed.message_id) {
+                    onMessageId?.(parsed.id)
+                  } else if (parsed.message_id !== undefined && parsed.tokens_used !== undefined) {
+                    flush()
+                    setIsStreaming(false)
+                    onComplete?.(bufferRef.current, parsed.message_id)
+                  }
+                  break
+              }
+            } catch {
+              // Invalid JSON in SSE data line — skip
+            }
+          }
+        }
+
+        setIsStreaming(false)
+      }
+
+      await read()
+
+    } catch (err) {
+      if (err.name === 'AbortError') return  // Intentional cancel
+
+      console.error('[Stream] Error:', err)
+      setIsStreaming(false)
+      onError?.(err.message || 'Connection failed')
+    }
+  }, [chatId, flush, onMessageId, onComplete, onError])
+
+  const cancelStream = useCallback(() => {
+    abortRef.current?.abort()
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    setIsStreaming(false)
+  }, [])
+
+  useEffect(() => {
+    return () => cancelStream()
+  }, [cancelStream])
+
+  return { isStreaming, streamContent, startStream, cancelStream }
+}
